@@ -39,7 +39,6 @@ public class ReportCommand : Command<ReportCommand.Settings>
 
         DateTimeOffset start;
         DateTimeOffset end = DateTimeOffset.UtcNow;
-        bool isHistoricalMonth = false;
 
         if (settings.Today)
         {
@@ -58,16 +57,29 @@ public class ReportCommand : Command<ReportCommand.Settings>
             }
             start = new DateTimeOffset(parsedMonth, TimeSpan.Zero);
             end = start.AddMonths(1);
-            
-            if (end < DateTimeOffset.UtcNow.AddDays(-90))
-            {
-                isHistoricalMonth = true; // Read from monthly_summary
-            }
         }
 
-        var data = isHistoricalMonth 
-            ? FetchSummaryData(dbManager, settings.Month!)
-            : FetchRawData(dbManager, start.ToUnixTimeSeconds(), end.ToUnixTimeSeconds());
+        var data = new List<ReportRow>();
+        if (!string.IsNullOrEmpty(settings.Month))
+        {
+            var summaryData = FetchSummaryData(dbManager, settings.Month);
+            var rawData = FetchRawData(dbManager, start.ToUnixTimeSeconds(), end.ToUnixTimeSeconds());
+            
+            data = summaryData.Concat(rawData)
+                .GroupBy(r => new { r.Category, r.Key, r.Browser })
+                .Select(g => new ReportRow
+                {
+                    Category = g.Key.Category,
+                    Key = g.Key.Key,
+                    Browser = g.Key.Browser,
+                    TotalSeconds = g.Sum(x => x.TotalSeconds)
+                })
+                .ToList();
+        }
+        else
+        {
+            data = FetchRawData(dbManager, start.ToUnixTimeSeconds(), end.ToUnixTimeSeconds());
+        }
 
         RenderReport(data);
 

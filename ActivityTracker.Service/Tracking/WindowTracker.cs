@@ -20,8 +20,16 @@ public partial class WindowTracker
     private WinEventDelegate? _dele;
     private IntPtr _hook;
 
+    private IntPtr _msgHwnd = IntPtr.Zero;
+
     private const uint EVENT_SYSTEM_FOREGROUND = 3;
     private const uint WINEVENT_OUTOFCONTEXT = 0;
+
+    internal Action<IntPtr>? OnWtsSessionChange;
+    internal Action<IntPtr>? OnPowerBroadcast;
+
+    private const string WndClassName = "ActivityTrackerMsgWnd";
+    private WndProcDelegate? _wndProcDelegate;
 
     private long? _currentSessionId;
     private DateTimeOffset _currentSessionStartTime;
@@ -37,12 +45,28 @@ public partial class WindowTracker
     {
         _logger.LogInformation("Starting Window Tracker...");
         _dele = new WinEventDelegate(WinEventProc);
-        
-        // Note: SetWinEventHook requires a message loop if used out of context, 
-        // but can sometimes work on a dedicated thread with a message pump.
-        // We will run this on a dedicated background thread with a message loop.
+
+        var windowReady = new ManualResetEventSlim(false);
+
         var hookThread = new Thread(() =>
         {
+            _wndProcDelegate = new WndProcDelegate(MsgWndProc);
+            var wndClass = new WNDCLASSEX
+            {
+                cbSize = (uint)Marshal.SizeOf<WNDCLASSEX>(),
+                lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
+                hInstance = GetModuleHandle(null),
+                lpszClassName = WndClassName
+            };
+            RegisterClassEx(ref wndClass);
+
+            _msgHwnd = CreateWindowEx(
+                0, WndClassName, "ActivityTrackerMsg",
+                0, 0, 0, 0, 0,
+                HWND_MESSAGE, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+
+            windowReady.Set();
+
             _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _dele, 0, 0, WINEVENT_OUTOFCONTEXT);
             
             // Standard Win32 message pump
@@ -56,9 +80,13 @@ public partial class WindowTracker
         hookThread.SetApartmentState(ApartmentState.STA);
         hookThread.Start();
         
+        windowReady.Wait(TimeSpan.FromSeconds(5));
+
         // Force log the initial foreground window
         LogForegroundWindow(GetForegroundWindow());
     }
+
+    public IntPtr GetMessageWindowHandle() => _msgHwnd;
 
     public void Stop()
     {
@@ -67,6 +95,10 @@ public partial class WindowTracker
             UnhookWinEvent(_hook);
             _hook = IntPtr.Zero;
         }
+        if (_msgHwnd != IntPtr.Zero)
+        {
+            PostMessage(_msgHwnd, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+        }
         CloseCurrentSession();
         _logger.LogInformation("Window Tracker stopped.");
     }
@@ -74,6 +106,21 @@ public partial class WindowTracker
     private void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
         LogForegroundWindow(hwnd);
+    }
+
+    private IntPtr MsgWndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        if (msg == WM_WTSSESSION_CHANGE)
+        {
+            OnWtsSessionChange?.Invoke(wParam);
+            return IntPtr.Zero;
+        }
+        if (msg == WM_POWERBROADCAST)
+        {
+            OnPowerBroadcast?.Invoke(wParam);
+            return (IntPtr)1;
+        }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
     public void ForceReevaluate()
@@ -118,12 +165,19 @@ public partial class WindowTracker
         }
     }
 
+    private static string NormalizeProcessName(string name)
+    {
+        if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            return name[..^4];
+        return name;
+    }
+
     private bool ShouldIgnore(string processName)
     {
-        var lowerProc = processName.ToLowerInvariant();
-        if (_config.ExcludeProcesses.Count > 0 && _config.ExcludeProcesses.Contains(lowerProc))
+        var normalized = NormalizeProcessName(processName).ToLowerInvariant();
+        if (_config.ExcludeProcesses.Count > 0 && _config.ExcludeProcesses.Exists(p => NormalizeProcessName(p).ToLowerInvariant() == normalized))
             return true;
-        if (_config.IncludeProcesses.Count > 0 && !_config.IncludeProcesses.Contains(lowerProc))
+        if (_config.IncludeProcesses.Count > 0 && !_config.IncludeProcesses.Exists(p => NormalizeProcessName(p).ToLowerInvariant() == normalized))
             return true;
         return false;
     }
@@ -150,6 +204,11 @@ public partial class WindowTracker
         GetWindowText(hwnd, builder, builder.Capacity);
         return builder.ToString();
     }
+
+    private const uint WM_QUIT = 0x0012;
+    private const uint WM_WTSSESSION_CHANGE = 0x02B1;
+    private const uint WM_POWERBROADCAST = 0x0218;
+    private static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
@@ -195,4 +254,41 @@ public partial class WindowTracker
 
     [DllImport("user32.dll")]
     private static extern IntPtr DispatchMessage([In] ref MSG lpmsg);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    private delegate IntPtr WndProcDelegate(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WNDCLASSEX
+    {
+        public uint cbSize;
+        public uint style;
+        public IntPtr lpfnWndProc;
+        public int cbClsExtra;
+        public int cbWndExtra;
+        public IntPtr hInstance;
+        public IntPtr hIcon;
+        public IntPtr hCursor;
+        public IntPtr hbrBackground;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? lpszMenuName;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpszClassName;
+        public IntPtr hIconSm;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern ushort RegisterClassEx([In] ref WNDCLASSEX lpwcx);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowEx(
+        uint dwExStyle, string lpClassName, string lpWindowName,
+        uint dwStyle, int x, int y, int nWidth, int nHeight,
+        IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DefWindowProc(IntPtr hWnd, uint uMsg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr GetModuleHandle(string? lpModuleName);
 }

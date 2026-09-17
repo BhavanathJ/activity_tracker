@@ -22,6 +22,10 @@ public class ExtensionListener
     // Store ongoing browser sessions to update their end times
     // Key: browser identifier
     private readonly System.Collections.Generic.Dictionary<string, long> _currentBrowserSessions = new();
+    
+    // Store ongoing audio sessions
+    // Key: (browser, domain)
+    private readonly System.Collections.Generic.Dictionary<(string, string), long> _currentAudioSessions = new();
 
     public ExtensionListener(ILogger logger, DatabaseManager dbManager)
     {
@@ -60,6 +64,12 @@ public class ExtensionListener
             _dbManager.UpdateEventEndTime(sessionId, now);
         }
         _currentBrowserSessions.Clear();
+
+        foreach (var sessionId in _currentAudioSessions.Values)
+        {
+            _dbManager.UpdateEventEndTime(sessionId, now);
+        }
+        _currentAudioSessions.Clear();
         
         _logger.LogInformation("HTTP Listener stopped.");
     }
@@ -167,26 +177,29 @@ public class ExtensionListener
         }
         
         // Handle Audio
-        if (payload.Audible && payload.IsAudioOnly)
+        if (payload.IsAudioOnly)
         {
-            // Only log audio if it's an audio-specific event (background tab).
-            // If it's the active tab and it's audible, it's already covered by the browser focus event above,
-            // or the extension handles sending an "audio only" flag when a background tab starts playing.
-            var audioRecord = new EventRecord
+            var key = (payload.Browser, domain);
+            if (payload.Audible && !payload.IsAudioStop)
             {
-                Type = "audio",
-                ProcessOrDomain = domain,
-                Browser = payload.Browser,
-                Title = payload.Title ?? "",
-                StartTime = now
-            };
-            // Note: We don't track audio session ends robustly yet, we'll need the extension to send an end event
-            // or we just log points in time. The spec says "Audio events: log only when a tab is audible".
-            // Let's assume the extension sends an event when audio starts, and another when it stops.
-            // For now, insert it and we'll handle the end time logic by keeping track of active audio per browser/tab.
-            
-            // To simplify, let's just insert it. If the extension sends an "AudioStop" we can find it and close it.
-            // We'll refine this based on the extension payload.
+                var audioRecord = new EventRecord
+                {
+                    Type = "audio",
+                    ProcessOrDomain = domain,
+                    Browser = payload.Browser,
+                    Title = payload.Title ?? "",
+                    StartTime = now
+                };
+                _currentAudioSessions[key] = _dbManager.InsertEvent(audioRecord);
+            }
+            else if (payload.IsAudioStop)
+            {
+                if (_currentAudioSessions.TryGetValue(key, out var sessionId))
+                {
+                    _dbManager.UpdateEventEndTime(sessionId, now);
+                    _currentAudioSessions.Remove(key);
+                }
+            }
         }
     }
 
