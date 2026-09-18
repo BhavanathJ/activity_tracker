@@ -29,26 +29,14 @@ public class SystemStateTracker
         _logger.LogInformation("Starting System State Tracker...");
         
         SessionChangeNotifier.OnSessionChange += HandleSessionChange;
-
-        var hwnd = _windowTracker.GetMessageWindowHandle();
-        if (hwnd != IntPtr.Zero)
-        {
-            _windowTracker.OnPowerBroadcast = HandlePowerBroadcast;
-        }
-        else
-        {
-            _logger.LogWarning("Could not register SystemStateTracker power broadcast: WindowTracker provided no HWND.");
-        }
+        PowerChangeNotifier.OnPowerChange += HandlePowerChange;
     }
 
     public void Stop()
     {
         SessionChangeNotifier.OnSessionChange -= HandleSessionChange;
+        PowerChangeNotifier.OnPowerChange -= HandlePowerChange;
 
-        if (_windowTracker != null)
-        {
-            _windowTracker.OnPowerBroadcast = null;
-        }
 
         _logger.LogInformation("System State Tracker stopped.");
     }
@@ -83,9 +71,8 @@ public class SystemStateTracker
         }
     }
 
-    private void HandlePowerBroadcast(IntPtr wParam)
+    private void HandlePowerChange(int eventType)
     {
-        int eventType = wParam.ToInt32();
         if (eventType == PBT_APMSUSPEND)
         {
             _logger.LogInformation("System Suspending.");

@@ -14,6 +14,16 @@ public static class SessionChangeNotifier
     }
 }
 
+public static class PowerChangeNotifier
+{
+    public static event Action<int>? OnPowerChange;
+
+    public static void Notify(int reason)
+    {
+        OnPowerChange?.Invoke(reason);
+    }
+}
+
 public class TrackerServiceBase : ServiceBase
 {
     private readonly IHost _host;
@@ -22,6 +32,7 @@ public class TrackerServiceBase : ServiceBase
     {
         _host = host;
         CanHandleSessionChangeEvent = true;
+        CanHandlePowerEvent = true;
     }
 
     protected override void OnStart(string[] args)
@@ -38,5 +49,19 @@ public class TrackerServiceBase : ServiceBase
     {
         SessionChangeNotifier.Notify((int)changeDescription.Reason);
         base.OnSessionChange(changeDescription);
+    }
+
+    protected override bool OnPowerEvent(PowerBroadcastStatus powerStatus)
+    {
+        if (powerStatus == PowerBroadcastStatus.Suspend)
+        {
+            PowerChangeNotifier.Notify(0x0004); // PBT_APMSUSPEND
+        }
+        else if (powerStatus == PowerBroadcastStatus.ResumeAutomatic)
+        {
+            PowerChangeNotifier.Notify(0x0012); // PBT_APMRESUMEAUTOMATIC
+        }
+
+        return base.OnPowerEvent(powerStatus);
     }
 }

@@ -26,7 +26,6 @@ public partial class WindowTracker
     private const uint WINEVENT_OUTOFCONTEXT = 0;
 
     internal Action<IntPtr>? OnWtsSessionChange;
-    internal Action<IntPtr>? OnPowerBroadcast;
 
     private const string WndClassName = "ActivityTrackerMsgWnd";
     private WndProcDelegate? _wndProcDelegate;
@@ -114,11 +113,6 @@ public partial class WindowTracker
         {
             OnWtsSessionChange?.Invoke(wParam);
             return IntPtr.Zero;
-        }
-        if (msg == WM_POWERBROADCAST)
-        {
-            OnPowerBroadcast?.Invoke(wParam);
-            return (IntPtr)1;
         }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
