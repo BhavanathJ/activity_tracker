@@ -4,14 +4,19 @@ using ActivityTracker.Service;
 using ActivityTracker.Core.Data;
 
 var builder = Host.CreateApplicationBuilder(args);
-builder.Services.AddWindowsService(options =>
-{
-    options.ServiceName = "ActivityTrackerService";
-});
+// AddWindowsService removed to manually handle session change notifications
 
 builder.Services.AddSingleton<DatabaseManager>();
 builder.Services.AddHostedService<Worker>();
 builder.Services.AddHostedService<ActivityTracker.Service.Jobs.RetentionJob>();
 
 var host = builder.Build();
-host.Run();
+
+if (!Environment.UserInteractive)
+{
+    System.ServiceProcess.ServiceBase.Run(new TrackerServiceBase(host));
+}
+else
+{
+    host.Run();
+}

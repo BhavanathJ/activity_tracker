@@ -12,9 +12,6 @@ public class SystemStateTracker
     private readonly WindowTracker _windowTracker;
     private readonly DatabaseManager _dbManager;
     private long? _lockSessionId;
-    private IntPtr _wtsSessionHandle = IntPtr.Zero;
-
-    private const int NOTIFY_FOR_THIS_SESSION = 0;
     private const int WTS_SESSION_LOCK = 0x7;
     private const int WTS_SESSION_UNLOCK = 0x8;
     private const int PBT_APMSUSPEND = 0x0004;
@@ -31,49 +28,34 @@ public class SystemStateTracker
     {
         _logger.LogInformation("Starting System State Tracker...");
         
+        SessionChangeNotifier.OnSessionChange += HandleSessionChange;
+
         var hwnd = _windowTracker.GetMessageWindowHandle();
         if (hwnd != IntPtr.Zero)
         {
-            if (WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
-            {
-                _wtsSessionHandle = hwnd;
-                _logger.LogInformation("WTS Session Notification registered successfully.");
-            }
-            else
-            {
-                _logger.LogWarning("Failed to register for WTS Session Notification.");
-            }
-
-            _windowTracker.OnWtsSessionChange = HandleWtsSessionChange;
             _windowTracker.OnPowerBroadcast = HandlePowerBroadcast;
         }
         else
         {
-            _logger.LogWarning("Could not register SystemStateTracker: WindowTracker provided no HWND.");
+            _logger.LogWarning("Could not register SystemStateTracker power broadcast: WindowTracker provided no HWND.");
         }
     }
 
     public void Stop()
     {
-        if (_wtsSessionHandle != IntPtr.Zero)
-        {
-            WTSUnRegisterSessionNotification(_wtsSessionHandle);
-            _wtsSessionHandle = IntPtr.Zero;
-        }
+        SessionChangeNotifier.OnSessionChange -= HandleSessionChange;
 
         if (_windowTracker != null)
         {
-            _windowTracker.OnWtsSessionChange = null;
             _windowTracker.OnPowerBroadcast = null;
         }
 
         _logger.LogInformation("System State Tracker stopped.");
     }
 
-    private void HandleWtsSessionChange(IntPtr wParam)
+    private void HandleSessionChange(int reason)
     {
         var now = DateTimeOffset.UtcNow;
-        int reason = wParam.ToInt32();
         
         if (reason == WTS_SESSION_LOCK)
         {
@@ -116,9 +98,4 @@ public class SystemStateTracker
         }
     }
 
-    [DllImport("wtsapi32.dll", SetLastError = true)]
-    private static extern bool WTSRegisterSessionNotification(IntPtr hWnd, int dwFlags);
-
-    [DllImport("wtsapi32.dll", SetLastError = true)]
-    private static extern bool WTSUnRegisterSessionNotification(IntPtr hWnd);
 }
