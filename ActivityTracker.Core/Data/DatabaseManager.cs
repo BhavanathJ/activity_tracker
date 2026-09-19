@@ -13,7 +13,7 @@ public class DatabaseManager
     public DatabaseManager()
     {
         var dbPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "ActivityTracker",
             "tracker.db");
             
@@ -38,7 +38,7 @@ public class DatabaseManager
     public DatabaseManager(bool readOnly)
     {
         var dbPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "ActivityTracker",
             "tracker.db");
 

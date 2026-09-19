@@ -8,7 +8,7 @@ namespace ActivityTracker.Core.Configuration;
 public static class ConfigManager
 {
     private static readonly string ConfigFilePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "ActivityTracker",
         "config.json");
 

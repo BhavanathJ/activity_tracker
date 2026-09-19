@@ -40,9 +40,9 @@ To have the tracker run continuously in the background and start on boot:
 
 ### First-Run Key Generation
 
-On the first run (either manually or via the Service), the application will generate a secure 256-bit encryption key using `RandomNumberGenerator`. This key is then encrypted via Windows DPAPI (`DataProtectionScope.CurrentUser`) and saved to `%LOCALAPPDATA%\ActivityTracker\db.key`. 
+On the first run (either manually or via the Service), the application will generate a secure 256-bit encryption key using `RandomNumberGenerator`. This key is then encrypted via Windows DPAPI (`DataProtectionScope.LocalMachine`) and saved to `%PROGRAMDATA%\ActivityTracker\db.key`. 
 
-Because it uses `CurrentUser`, the CLI and the Service must run under the **same user account** to access the database. The database itself is stored in `%LOCALAPPDATA%\ActivityTracker\tracker.db`.
+The database itself is stored in `%PROGRAMDATA%\ActivityTracker\tracker.db`.
 
 ## Browser Extension Installation
 
