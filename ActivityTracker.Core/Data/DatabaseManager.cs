@@ -106,6 +106,33 @@ public class DatabaseManager
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
 
+        // Fetch start_time to validate before writing
+        using var checkCmd = connection.CreateCommand();
+        checkCmd.CommandText = "SELECT start_time, process_or_domain FROM events WHERE id = @id;";
+        checkCmd.Parameters.AddWithValue("@id", id);
+
+        using var reader = checkCmd.ExecuteReader();
+        if (!reader.Read()) return; // row already deleted
+
+        var startTime = reader.GetInt64(0);
+        var processOrDomain = reader.GetString(1);
+        reader.Close();
+
+        if (endTime < startTime)
+        {
+            // Negative duration — discard the row rather than corrupt report data.
+            // The warning is deliberately noisy so regressions surface in logs.
+            Console.Error.WriteLine(
+                $"[WARN] Negative-duration event discarded: id={id}, " +
+                $"process={processOrDomain}, start_time={startTime}, end_time={endTime}");
+
+            using var delCmd = connection.CreateCommand();
+            delCmd.CommandText = "DELETE FROM events WHERE id = @id;";
+            delCmd.Parameters.AddWithValue("@id", id);
+            delCmd.ExecuteNonQuery();
+            return;
+        }
+
         using var command = connection.CreateCommand();
         command.CommandText = "UPDATE events SET end_time = @end_time WHERE id = @id;";
         command.Parameters.AddWithValue("@end_time", endTime);

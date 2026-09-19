@@ -30,6 +30,7 @@ public partial class WindowTracker
     private const string WndClassName = "ActivityTrackerMsgWnd";
     private WndProcDelegate? _wndProcDelegate;
 
+    private readonly object _sessionLock = new();
     private long? _currentSessionId;
     private DateTimeOffset _currentSessionStartTime;
 
@@ -119,41 +120,75 @@ public partial class WindowTracker
 
     public void ForceReevaluate()
     {
-        LogForegroundWindow(GetForegroundWindow());
+        lock (_sessionLock)
+        {
+            LogForegroundWindow(GetForegroundWindow());
+        }
     }
 
     private void LogForegroundWindow(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return;
 
-        CloseCurrentSession();
-
+        // Gather window info outside the lock — P/Invoke + process
+        // lookup can block and don't touch session state.
         GetWindowThreadProcessId(hwnd, out uint pid);
         var processName = GetProcessName(pid);
         var title = GetWindowTitle(hwnd);
 
         if (ShouldIgnore(processName)) return;
 
-        var now = DateTimeOffset.UtcNow;
-        var record = new EventRecord
+        lock (_sessionLock)
         {
-            Type = "window",
-            ProcessOrDomain = processName,
-            Title = title,
-            StartTime = now.ToUnixTimeSeconds()
-        };
+            CloseCurrentSessionLocked();
 
-        _currentSessionId = _dbManager.InsertEvent(record);
-        _currentSessionStartTime = now;
-        
-        _logger.LogInformation($"Foreground changed: {processName} - {title}");
+            var now = DateTimeOffset.UtcNow;
+            var record = new EventRecord
+            {
+                Type = "window",
+                ProcessOrDomain = processName,
+                Title = title,
+                StartTime = now.ToUnixTimeSeconds()
+            };
+
+            _currentSessionId = _dbManager.InsertEvent(record);
+            _currentSessionStartTime = now;
+
+            _logger.LogInformation($"Foreground changed: {processName} - {title}");
+        }
     }
 
     public void CloseCurrentSession(DateTimeOffset? endTime = null)
     {
+        lock (_sessionLock)
+        {
+            CloseCurrentSessionLocked(endTime);
+        }
+    }
+
+    /// <summary>
+    /// Core close logic — caller MUST already hold <see cref="_sessionLock"/>.
+    /// </summary>
+    private void CloseCurrentSessionLocked(DateTimeOffset? endTime = null)
+    {
         if (_currentSessionId.HasValue)
         {
             var end = endTime ?? DateTimeOffset.UtcNow;
+
+            // Defensive check: discard sessions with negative duration,
+            // which indicate a prior race slipped through or a clock anomaly.
+            if (end < _currentSessionStartTime)
+            {
+                _logger.LogWarning(
+                    "Negative-duration session detected and discarded. " +
+                    "SessionId={SessionId}, StartTime={StartTime}, EndTime={EndTime}",
+                    _currentSessionId.Value,
+                    _currentSessionStartTime.ToString("o"),
+                    end.ToString("o"));
+                _currentSessionId = null;
+                return;
+            }
+
             _dbManager.UpdateEventEndTime(_currentSessionId.Value, end.ToUnixTimeSeconds());
             _currentSessionId = null;
         }
