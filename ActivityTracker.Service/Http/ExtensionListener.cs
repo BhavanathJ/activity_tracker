@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using ActivityTracker.Core.Data;
 using ActivityTracker.Core.Models;
 using ActivityTracker.Core.Configuration;
+using ActivityTracker.Service.Tracking;
 
 namespace ActivityTracker.Service.Http;
 
@@ -15,6 +16,7 @@ public class ExtensionListener
 {
     private readonly ILogger _logger;
     private readonly DatabaseManager _dbManager;
+    private readonly WindowTracker _windowTracker;
     private readonly TrackerConfig _config;
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -27,10 +29,11 @@ public class ExtensionListener
     // Key: (browser, domain)
     private readonly System.Collections.Generic.Dictionary<(string, string), long> _currentAudioSessions = new();
 
-    public ExtensionListener(ILogger logger, DatabaseManager dbManager)
+    public ExtensionListener(ILogger logger, DatabaseManager dbManager, WindowTracker windowTracker)
     {
         _logger = logger;
         _dbManager = dbManager;
+        _windowTracker = windowTracker;
         _config = ConfigManager.Load();
     }
 
@@ -134,6 +137,21 @@ public class ExtensionListener
                 return;
             }
 
+            if (context.Request.Url!.AbsolutePath == "/idle" && context.Request.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(context.Request.InputStream);
+                var body = await reader.ReadToEndAsync();
+
+                var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.IdleEventPayload);
+                if (payload != null)
+                {
+                    HandleIdleEvent(payload);
+                }
+
+                context.Response.StatusCode = 200;
+                return;
+            }
+
             context.Response.StatusCode = 404;
         }
         catch (Exception ex)
@@ -200,6 +218,22 @@ public class ExtensionListener
                     _currentAudioSessions.Remove(key);
                 }
             }
+        }
+    }
+
+    private void HandleIdleEvent(IdleEventPayload payload)
+    {
+        if (payload.State == "idle")
+        {
+            _logger.LogInformation($"SessionAgent reports idle ({payload.IdleSeconds:F0}s).");
+            // Backdate the session end to when input actually stopped
+            var endTime = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
+            _windowTracker.CloseCurrentSession(endTime);
+        }
+        else if (payload.State == "active")
+        {
+            _logger.LogInformation("SessionAgent reports user active.");
+            _windowTracker.ForceReevaluate();
         }
     }
 

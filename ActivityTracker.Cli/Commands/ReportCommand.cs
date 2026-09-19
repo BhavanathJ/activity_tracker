@@ -24,10 +24,20 @@ public class ReportCommand : Command<ReportCommand.Settings>
         [CommandOption("--month")]
         [Description("Show report for a specific month (YYYY-MM)")]
         public string? Month { get; set; }
+
+        [CommandOption("--raw")]
+        [Description("Dump raw event rows for a given process name (today only, diagnostic)")]
+        public string? RawProcess { get; set; }
     }
 
     public override int Execute(CommandContext context, Settings settings)
     {
+        // Diagnostic: dump raw event rows for a process
+        if (!string.IsNullOrEmpty(settings.RawProcess))
+        {
+            return ExecuteRawDump(settings.RawProcess);
+        }
+
         if (!settings.Today && !settings.Week && string.IsNullOrEmpty(settings.Month))
         {
             AnsiConsole.MarkupLine("[red]Please specify a timeframe: --today, --week, or --month YYYY-MM[/]");
@@ -83,6 +93,53 @@ public class ReportCommand : Command<ReportCommand.Settings>
 
         RenderReport(data);
 
+        return 0;
+    }
+
+    private int ExecuteRawDump(string processName)
+    {
+        var dbManager = new DatabaseManager(readOnly: true);
+        var todayUnix = new DateTimeOffset(DateTimeOffset.UtcNow.Date, TimeSpan.Zero).ToUnixTimeSeconds();
+        var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        using var conn = dbManager.GetConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"
+            SELECT id, process_or_domain, title, start_time, end_time
+            FROM events
+            WHERE process_or_domain = @process AND start_time >= @today
+            ORDER BY start_time;
+        ";
+        cmd.Parameters.AddWithValue("@process", processName);
+        cmd.Parameters.AddWithValue("@today", todayUnix);
+
+        using var reader = cmd.ExecuteReader();
+        int count = 0;
+        while (reader.Read())
+        {
+            var id = reader.GetInt64(0);
+            var process = reader.GetString(1);
+            var title = reader.GetString(2);
+            var startTime = reader.GetInt64(3);
+            var endTime = reader.IsDBNull(4) ? (long?)null : reader.GetInt64(4);
+
+            var effectiveEnd = endTime ?? nowUnix;
+            var duration = effectiveEnd - startTime;
+
+            var startDto = DateTimeOffset.FromUnixTimeSeconds(startTime);
+            var endStr = endTime.HasValue
+                ? DateTimeOffset.FromUnixTimeSeconds(endTime.Value).ToString("HH:mm:ss")
+                : "(open)";
+
+            var durationStr = duration < 0 ? $"{duration}s **NEGATIVE**" : $"{duration}s";
+
+            Console.WriteLine(
+                $"ID: {id}  Start: {startDto:HH:mm:ss}  End: {endStr}  " +
+                $"Duration: {durationStr}  Process: {process}  Title: {title}");
+            count++;
+        }
+
+        Console.WriteLine($"\n{count} row(s) for '{processName}' today.");
         return 0;
     }
 
