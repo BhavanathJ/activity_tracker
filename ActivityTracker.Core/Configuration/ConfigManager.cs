@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using ActivityTracker.Core.Configuration;
 
 namespace ActivityTracker.Core.Configuration;
@@ -23,12 +24,12 @@ public static class ConfigManager
                 Directory.CreateDirectory(directory);
             }
             
-            var json = JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(defaultConfig, TrackerConfigJsonContext.Default.TrackerConfig);
             File.WriteAllText(ConfigFilePath, json);
             return defaultConfig;
         }
 
         var existingJson = File.ReadAllText(ConfigFilePath);
-        return JsonSerializer.Deserialize<TrackerConfig>(existingJson) ?? new TrackerConfig();
+        return JsonSerializer.Deserialize(existingJson, TrackerConfigJsonContext.Default.TrackerConfig) ?? new TrackerConfig();
     }
 }

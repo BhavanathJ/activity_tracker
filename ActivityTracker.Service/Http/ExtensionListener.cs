@@ -113,7 +113,7 @@ public class ExtensionListener
             if (context.Request.Url!.AbsolutePath == "/config" && context.Request.HttpMethod == "GET")
             {
                 context.Response.ContentType = "application/json";
-                var configJson = JsonSerializer.Serialize(_config);
+                var configJson = JsonSerializer.Serialize(_config, ServiceJsonContext.Default.TrackerConfig);
                 using var writer = new StreamWriter(context.Response.OutputStream);
                 await writer.WriteAsync(configJson);
                 return;
@@ -124,7 +124,7 @@ public class ExtensionListener
                 using var reader = new StreamReader(context.Request.InputStream);
                 var body = await reader.ReadToEndAsync();
                 
-                var payload = JsonSerializer.Deserialize<ExtensionEventPayload>(body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.ExtensionEventPayload);
                 if (payload != null)
                 {
                     HandleBrowserEvent(payload);
