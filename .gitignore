@@ -3,6 +3,15 @@ obj/
 *.user
 *.suo
 .vs/
+.vscode/
+.idea/
 *.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 *.key
 config.json
+*.log
+logs/
+

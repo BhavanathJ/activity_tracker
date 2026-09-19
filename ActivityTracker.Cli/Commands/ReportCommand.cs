@@ -52,11 +52,13 @@ public class ReportCommand : Command<ReportCommand.Settings>
 
         if (settings.Today)
         {
-            start = DateTimeOffset.UtcNow.Date;
+            var localToday = DateTime.Today;
+            start = new DateTimeOffset(localToday, DateTimeOffset.Now.Offset);
         }
         else if (settings.Week)
         {
-            start = DateTimeOffset.UtcNow.Date.AddDays(-7);
+            var localWeekStart = DateTime.Today.AddDays(-7);
+            start = new DateTimeOffset(localWeekStart, DateTimeOffset.Now.Offset);
         }
         else
         {
@@ -65,7 +67,7 @@ public class ReportCommand : Command<ReportCommand.Settings>
                 AnsiConsole.MarkupLine("[red]Invalid month format. Use YYYY-MM.[/]");
                 return 1;
             }
-            start = new DateTimeOffset(parsedMonth, TimeSpan.Zero);
+            start = new DateTimeOffset(parsedMonth, DateTimeOffset.Now.Offset);
             end = start.AddMonths(1);
         }
 
@@ -91,7 +93,7 @@ public class ReportCommand : Command<ReportCommand.Settings>
             data = FetchRawData(dbManager, start.ToUnixTimeSeconds(), end.ToUnixTimeSeconds());
         }
 
-        RenderReport(data);
+        RenderReport(data, start, end);
 
         return 0;
     }
@@ -99,7 +101,8 @@ public class ReportCommand : Command<ReportCommand.Settings>
     private int ExecuteRawDump(string processName)
     {
         var dbManager = new DatabaseManager(readOnly: true);
-        var todayUnix = new DateTimeOffset(DateTimeOffset.UtcNow.Date, TimeSpan.Zero).ToUnixTimeSeconds();
+        var todayLocal = DateTime.Today;
+        var todayUnix = new DateTimeOffset(todayLocal, DateTimeOffset.Now.Offset).ToUnixTimeSeconds();
         var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         using var conn = dbManager.GetConnection();
@@ -126,9 +129,9 @@ public class ReportCommand : Command<ReportCommand.Settings>
             var effectiveEnd = endTime ?? nowUnix;
             var duration = effectiveEnd - startTime;
 
-            var startDto = DateTimeOffset.FromUnixTimeSeconds(startTime);
+            var startDto = DateTimeOffset.FromUnixTimeSeconds(startTime).ToLocalTime();
             var endStr = endTime.HasValue
-                ? DateTimeOffset.FromUnixTimeSeconds(endTime.Value).ToString("HH:mm:ss")
+                ? DateTimeOffset.FromUnixTimeSeconds(endTime.Value).ToLocalTime().ToString("HH:mm:ss")
                 : "(open)";
 
             var durationStr = duration < 0 ? $"{duration}s **NEGATIVE**" : $"{duration}s";
@@ -194,13 +197,15 @@ public class ReportCommand : Command<ReportCommand.Settings>
         return data;
     }
 
-    private void RenderReport(List<ReportRow> data)
+    private void RenderReport(List<ReportRow> data, DateTimeOffset start, DateTimeOffset end)
     {
         if (data.Count == 0)
         {
             AnsiConsole.MarkupLine("[yellow]No data found for the selected timeframe.[/]");
             return;
         }
+
+        AnsiConsole.MarkupLine($"[dim]Report period: {start.ToLocalTime():yyyy-MM-dd HH:mm:ss} to {end.ToLocalTime():yyyy-MM-dd HH:mm:ss} ({TimeZoneInfo.Local.StandardName})[/]\n");
 
         RenderCategoryTable(data, "window", "Apps / Window Focus", "cyan");
         RenderCategoryTable(data, "browser", "Browser Domains", "green", showBrowser: true);

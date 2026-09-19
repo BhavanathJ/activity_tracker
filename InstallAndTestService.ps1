@@ -1,6 +1,6 @@
 # Run this script in an Administrative PowerShell prompt to register, start and test the service
-$exePath = "c:\My Files\Project\Activity Tracker\ActivityTracker.Service\bin\Release\net8.0-windows\ActivityTracker.Service.exe"
-$agentPath = "c:\My Files\Project\Activity Tracker\ActivityTracker.SessionAgent\bin\Release\net8.0-windows\ActivityTracker.SessionAgent.exe"
+$exePath = Join-Path $PSScriptRoot "ActivityTracker.Service\bin\Release\net8.0-windows\ActivityTracker.Service.exe"
+$agentPath = Join-Path $PSScriptRoot "ActivityTracker.SessionAgent\bin\Release\net8.0-windows\win-x64\publish\ActivityTracker.SessionAgent.exe"
 
 # 1. Register the service
 sc.exe create ActivityTrackerService binPath= "`"$exePath`"" start= auto
