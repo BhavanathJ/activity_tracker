@@ -23,7 +23,7 @@ public class IdleMonitor
 
     public void Start()
     {
-        Console.Error.WriteLine($"[SessionAgent] Idle monitor started (timeout={_idleTimeoutSeconds}s).");
+        FileLogger.LogInfo($"Idle monitor started (timeout={_idleTimeoutSeconds}s).");
         _timer = new Timer(CheckIdle, null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
     }
 
@@ -31,7 +31,7 @@ public class IdleMonitor
     {
         _timer?.Dispose();
         _httpClient.Dispose();
-        Console.Error.WriteLine("[SessionAgent] Idle monitor stopped.");
+        FileLogger.LogInfo("Idle monitor stopped.");
     }
 
     private void CheckIdle(object? state)
@@ -49,7 +49,7 @@ public class IdleMonitor
             {
                 if (!_isIdle)
                 {
-                    Console.Error.WriteLine($"[SessionAgent] Idle detected ({idleSeconds:F0}s >= {_idleTimeoutSeconds}s).");
+                    FileLogger.LogInfo($"Idle detected ({idleSeconds:F0}s >= {_idleTimeoutSeconds}s).");
                     _isIdle = true;
                     PostIdleState("idle", idleSeconds);
                 }
@@ -58,7 +58,7 @@ public class IdleMonitor
             {
                 if (_isIdle)
                 {
-                    Console.Error.WriteLine("[SessionAgent] User active again.");
+                    FileLogger.LogInfo("User active again.");
                     _isIdle = false;
                     PostIdleState("active", 0);
                 }
@@ -73,12 +73,12 @@ public class IdleMonitor
             var json = $"{{\"state\":\"{idleState}\",\"idleSeconds\":{idleSeconds:F1}}}";
             var content = new StringContent(json, Encoding.UTF8, "application/json");
             var response = _httpClient.PostAsync(_serviceUrl, content).GetAwaiter().GetResult();
-            Console.Error.WriteLine($"[SessionAgent] POST /idle ({idleState}) -> {(int)response.StatusCode}");
+            FileLogger.LogInfo($"POST /idle ({idleState}) -> {(int)response.StatusCode}");
         }
         catch (Exception ex)
         {
             // Service may not be running yet — silently retry on next cycle
-            Console.Error.WriteLine($"[SessionAgent] POST /idle failed: {ex.Message}");
+            FileLogger.LogWarn($"POST /idle failed: {ex.Message}");
         }
     }
 

@@ -8,20 +8,26 @@ public class Program
 {
     public static void Main(string[] args)
     {
+        FileLogger.LogInfo("SessionAgent starting.");
         var config = ConfigManager.Load();
         var monitor = new IdleMonitor(config.IdleTimeoutSeconds, config.HttpPort);
 
         monitor.Start();
 
-        // Block until the process is killed (Task Scheduler or manual termination)
+        // Block until the process is killed (Task Scheduler, logoff, or manual termination)
         using var exitEvent = new ManualResetEventSlim(false);
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
             exitEvent.Set();
         };
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            exitEvent.Set();
+        };
         exitEvent.Wait();
 
         monitor.Stop();
+        FileLogger.LogInfo("SessionAgent stopped.");
     }
 }
