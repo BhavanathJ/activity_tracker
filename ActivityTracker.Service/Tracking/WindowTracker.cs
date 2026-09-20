@@ -68,6 +68,15 @@ public partial class WindowTracker
             windowReady.Set();
 
             _hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _dele, 0, 0, WINEVENT_OUTOFCONTEXT);
+            if (_hook == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                _logger.LogError($"SetWinEventHook FAILED. Win32 error code: {error}");
+            }
+            else
+            {
+                _logger.LogInformation("SetWinEventHook succeeded, hook registered.");
+            }
             
             // Standard Win32 message pump
             while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -239,7 +248,7 @@ public partial class WindowTracker
     private const uint WM_POWERBROADCAST = 0x0218;
     private static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
 
     [DllImport("user32.dll")]
