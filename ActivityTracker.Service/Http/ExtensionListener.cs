@@ -29,6 +29,8 @@ public class ExtensionListener
     // Key: (browser, domain)
     private readonly System.Collections.Generic.Dictionary<(string, string), long> _currentAudioSessions = new();
 
+    private readonly object _sessionLock = new();
+
     public ExtensionListener(ILogger logger, DatabaseManager dbManager, WindowTracker windowTracker)
     {
         _logger = logger;
@@ -62,17 +64,20 @@ public class ExtensionListener
         
         // Close all browser sessions
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        foreach (var sessionId in _currentBrowserSessions.Values)
+        lock (_sessionLock)
         {
-            _dbManager.UpdateEventEndTime(sessionId, now);
-        }
-        _currentBrowserSessions.Clear();
+            foreach (var sessionId in _currentBrowserSessions.Values)
+            {
+                _dbManager.UpdateEventEndTime(sessionId, now);
+            }
+            _currentBrowserSessions.Clear();
 
-        foreach (var sessionId in _currentAudioSessions.Values)
-        {
-            _dbManager.UpdateEventEndTime(sessionId, now);
+            foreach (var sessionId in _currentAudioSessions.Values)
+            {
+                _dbManager.UpdateEventEndTime(sessionId, now);
+            }
+            _currentAudioSessions.Clear();
         }
-        _currentAudioSessions.Clear();
         
         _logger.LogInformation("HTTP Listener stopped.");
     }
@@ -174,48 +179,51 @@ public class ExtensionListener
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-        // If it's a focus event, close the previous session for this browser
-        if (!payload.IsAudioOnly)
+        lock (_sessionLock)
         {
-            if (_currentBrowserSessions.TryGetValue(payload.Browser, out var prevSessionId))
+            // If it's a focus event, close the previous session for this browser
+            if (!payload.IsAudioOnly)
             {
-                _dbManager.UpdateEventEndTime(prevSessionId, now);
-            }
-
-            var record = new EventRecord
-            {
-                Type = "browser",
-                ProcessOrDomain = domain,
-                Browser = payload.Browser,
-                Title = payload.Title ?? "",
-                StartTime = now
-            };
-            
-            _currentBrowserSessions[payload.Browser] = _dbManager.InsertEvent(record);
-        }
-        
-        // Handle Audio
-        if (payload.IsAudioOnly)
-        {
-            var key = (payload.Browser, domain);
-            if (payload.Audible && !payload.IsAudioStop)
-            {
-                var audioRecord = new EventRecord
+                if (_currentBrowserSessions.TryGetValue(payload.Browser, out var prevSessionId))
                 {
-                    Type = "audio",
+                    _dbManager.UpdateEventEndTime(prevSessionId, now);
+                }
+
+                var record = new EventRecord
+                {
+                    Type = "browser",
                     ProcessOrDomain = domain,
                     Browser = payload.Browser,
                     Title = payload.Title ?? "",
                     StartTime = now
                 };
-                _currentAudioSessions[key] = _dbManager.InsertEvent(audioRecord);
+                
+                _currentBrowserSessions[payload.Browser] = _dbManager.InsertEvent(record);
             }
-            else if (payload.IsAudioStop)
+            
+            // Handle Audio
+            if (payload.IsAudioOnly)
             {
-                if (_currentAudioSessions.TryGetValue(key, out var sessionId))
+                var key = (payload.Browser, domain);
+                if (payload.Audible && !payload.IsAudioStop)
                 {
-                    _dbManager.UpdateEventEndTime(sessionId, now);
-                    _currentAudioSessions.Remove(key);
+                    var audioRecord = new EventRecord
+                    {
+                        Type = "audio",
+                        ProcessOrDomain = domain,
+                        Browser = payload.Browser,
+                        Title = payload.Title ?? "",
+                        StartTime = now
+                    };
+                    _currentAudioSessions[key] = _dbManager.InsertEvent(audioRecord);
+                }
+                else if (payload.IsAudioStop)
+                {
+                    if (_currentAudioSessions.TryGetValue(key, out var sessionId))
+                    {
+                        _dbManager.UpdateEventEndTime(sessionId, now);
+                        _currentAudioSessions.Remove(key);
+                    }
                 }
             }
         }
@@ -249,11 +257,21 @@ public class ExtensionListener
     private bool ShouldIgnoreDomain(string domain)
     {
         var lowerDomain = domain.ToLowerInvariant();
-        if (_config.ExcludeDomains.Count > 0 && _config.ExcludeDomains.Exists(d => lowerDomain.Contains(d.ToLowerInvariant())))
+        if (_config.ExcludeDomains.Count > 0 && _config.ExcludeDomains.Exists(d => DomainMatches(lowerDomain, d.ToLowerInvariant())))
             return true;
-        if (_config.IncludeDomains.Count > 0 && !_config.IncludeDomains.Exists(d => lowerDomain.Contains(d.ToLowerInvariant())))
+        if (_config.IncludeDomains.Count > 0 && !_config.IncludeDomains.Exists(d => DomainMatches(lowerDomain, d.ToLowerInvariant())))
             return true;
         return false;
+    }
+
+    /// <summary>
+    /// Returns true if <paramref name="domain"/> equals <paramref name="pattern"/>
+    /// or is a subdomain of it (i.e. ends with "." + pattern).
+    /// For example: "mail.google.com" matches "google.com", but "notgoogle.com" does not.
+    /// </summary>
+    private static bool DomainMatches(string domain, string pattern)
+    {
+        return domain == pattern || domain.EndsWith("." + pattern, StringComparison.Ordinal);
     }
 }
 

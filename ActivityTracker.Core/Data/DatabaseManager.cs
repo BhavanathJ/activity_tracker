@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
 using ActivityTracker.Core.Models;
 
 namespace ActivityTracker.Core.Data;
@@ -9,9 +10,12 @@ namespace ActivityTracker.Core.Data;
 public class DatabaseManager
 {
     private readonly string _connectionString;
+    private readonly ILogger? _logger;
 
-    public DatabaseManager()
+    public DatabaseManager(ILogger<DatabaseManager>? logger = null)
     {
+        _logger = logger;
+
         var dbPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "ActivityTracker",
@@ -35,8 +39,10 @@ public class DatabaseManager
     }
     
     // For CLI ReadOnly access
-    public DatabaseManager(bool readOnly)
+    public DatabaseManager(bool readOnly, ILogger? logger = null)
     {
+        _logger = logger;
+
         var dbPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "ActivityTracker",
@@ -122,9 +128,9 @@ public class DatabaseManager
         {
             // Negative duration — discard the row rather than corrupt report data.
             // The warning is deliberately noisy so regressions surface in logs.
-            Console.Error.WriteLine(
-                $"[WARN] Negative-duration event discarded: id={id}, " +
-                $"process={processOrDomain}, start_time={startTime}, end_time={endTime}");
+            _logger?.LogWarning(
+                "Negative-duration event discarded: id={EventId}, process={Process}, start_time={StartTime}, end_time={EndTime}",
+                id, processOrDomain, startTime, endTime);
 
             using var delCmd = connection.CreateCommand();
             delCmd.CommandText = "DELETE FROM events WHERE id = @id;";

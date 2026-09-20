@@ -67,7 +67,7 @@ public class RetentionJob : BackgroundService
                     browser,
                     SUM(COALESCE(end_time, @now) - start_time) as total_seconds
                 FROM events
-                WHERE start_time < @cutoff
+                WHERE start_time < @cutoff AND end_time IS NOT NULL
                 GROUP BY month, category, key, browser
                 ON CONFLICT(month, category, key, browser) DO UPDATE SET
                     total_seconds = total_seconds + excluded.total_seconds;
@@ -79,7 +79,7 @@ public class RetentionJob : BackgroundService
             // 2. Delete raw rows
             using var cmdDelete = conn.CreateCommand();
             cmdDelete.Transaction = tx;
-            cmdDelete.CommandText = "DELETE FROM events WHERE start_time < @cutoff;";
+            cmdDelete.CommandText = "DELETE FROM events WHERE start_time < @cutoff AND end_time IS NOT NULL;";
             cmdDelete.Parameters.AddWithValue("@cutoff", cutoffUnix);
             var deletedRows = cmdDelete.ExecuteNonQuery();
 

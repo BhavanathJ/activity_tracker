@@ -15,21 +15,45 @@ public static class ConfigManager
 
     public static TrackerConfig Load()
     {
-        if (!File.Exists(ConfigFilePath))
+        if (File.Exists(ConfigFilePath))
         {
-            var defaultConfig = new TrackerConfig();
-            var directory = Path.GetDirectoryName(ConfigFilePath);
-            if (!Directory.Exists(directory) && directory != null)
+            try
             {
-                Directory.CreateDirectory(directory);
+                var existingJson = File.ReadAllText(ConfigFilePath);
+                var config = JsonSerializer.Deserialize(existingJson, TrackerConfigJsonContext.Default.TrackerConfig);
+                if (config != null)
+                {
+                    return config;
+                }
             }
-            
-            var json = JsonSerializer.Serialize(defaultConfig, TrackerConfigJsonContext.Default.TrackerConfig);
-            File.WriteAllText(ConfigFilePath, json);
-            return defaultConfig;
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"[WARN] Failed to deserialize {ConfigFilePath}: {ex.Message}. " +
+                    "Renaming to config.json.broken and regenerating defaults.");
+
+                try
+                {
+                    var brokenPath = ConfigFilePath + ".broken";
+                    File.Move(ConfigFilePath, brokenPath, overwrite: true);
+                }
+                catch
+                {
+                    // If rename fails, just proceed to overwrite with defaults
+                }
+            }
         }
 
-        var existingJson = File.ReadAllText(ConfigFilePath);
-        return JsonSerializer.Deserialize(existingJson, TrackerConfigJsonContext.Default.TrackerConfig) ?? new TrackerConfig();
+        // Either file doesn't exist, deserialization failed, or returned null — generate defaults
+        var defaultConfig = new TrackerConfig();
+        var directory = Path.GetDirectoryName(ConfigFilePath);
+        if (!Directory.Exists(directory) && directory != null)
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var json = JsonSerializer.Serialize(defaultConfig, TrackerConfigJsonContext.Default.TrackerConfig);
+        File.WriteAllText(ConfigFilePath, json);
+        return defaultConfig;
     }
 }
