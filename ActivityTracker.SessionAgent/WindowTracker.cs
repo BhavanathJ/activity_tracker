@@ -102,6 +102,15 @@ public class WindowTracker
         FileLogger.LogInfo("Window Tracker stopped.");
     }
 
+    public void ForceReport()
+    {
+        // Clear debounce state so the current window is guaranteed to be re-reported
+        _lastReportedProcess = "";
+        _lastReportedTitle = "";
+        
+        LogForegroundWindow(GetForegroundWindow());
+    }
+
     private void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
         LogForegroundWindow(hwnd);
