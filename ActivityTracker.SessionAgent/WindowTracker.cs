@@ -170,6 +170,11 @@ public class WindowTracker
     private bool ShouldIgnore(string processName)
     {
         var normalized = NormalizeProcessName(processName).ToLowerInvariant();
+        
+        // Hardcoded exclusions for lock screen to prevent double-counting locked time
+        if (normalized == "lockapp" || normalized == "logonui")
+            return true;
+            
         if (_config.ExcludeProcesses.Count > 0 && _config.ExcludeProcesses.Exists(p => NormalizeProcessName(p).ToLowerInvariant() == normalized))
             return true;
         if (_config.IncludeProcesses.Count > 0 && !_config.IncludeProcesses.Exists(p => NormalizeProcessName(p).ToLowerInvariant() == normalized))
