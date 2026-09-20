@@ -13,7 +13,7 @@ public class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
     private readonly DatabaseManager _dbManager;
-    private WindowTracker? _windowTracker;
+    private WindowSessionManager? _windowSessionManager;
     private ExtensionListener? _httpListener;
     private SystemStateTracker? _systemStateTracker;
 
@@ -27,16 +27,16 @@ public class Worker : BackgroundService
     {
         _logger.LogInformation("Activity Tracker Service starting.");
 
-        _windowTracker = new WindowTracker(_logger, _dbManager);
-        _httpListener = new ExtensionListener(_logger, _dbManager, _windowTracker);
+        _windowSessionManager = new WindowSessionManager(_logger, _dbManager);
+        _httpListener = new ExtensionListener(_logger, _dbManager, _windowSessionManager);
         
         // SystemStateTracker needs to hook into power/session events. 
         // In a true Windows Service, we'd override OnSessionChange/OnPowerEvent in ServiceBase.
         // For BackgroundService we might need to use SystemEvents (which requires a message pump) 
         // or WTSRegisterSessionNotification. We'll implement this carefully in SystemStateTracker.
-        _systemStateTracker = new SystemStateTracker(_logger, _windowTracker, _dbManager);
+        _systemStateTracker = new SystemStateTracker(_logger, _windowSessionManager, _dbManager);
 
-        _windowTracker.Start();
+
         _httpListener.Start();
         _systemStateTracker.Start();
 
@@ -55,7 +55,7 @@ public class Worker : BackgroundService
         {
             _systemStateTracker.Stop();
             _httpListener.Stop();
-            _windowTracker.Stop();
+
             _logger.LogInformation("Activity Tracker Service stopped.");
         }
     }

@@ -9,7 +9,7 @@ namespace ActivityTracker.Service.Tracking;
 public class SystemStateTracker
 {
     private readonly ILogger _logger;
-    private readonly WindowTracker _windowTracker;
+    private readonly WindowSessionManager _windowSessionManager;
     private readonly DatabaseManager _dbManager;
     private long? _lockSessionId;
     private const int WTS_SESSION_LOCK = 0x7;
@@ -17,10 +17,10 @@ public class SystemStateTracker
     private const int PBT_APMSUSPEND = 0x0004;
     private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
 
-    public SystemStateTracker(ILogger logger, WindowTracker windowTracker, DatabaseManager dbManager)
+    public SystemStateTracker(ILogger logger, WindowSessionManager windowSessionManager, DatabaseManager dbManager)
     {
         _logger = logger;
-        _windowTracker = windowTracker;
+        _windowSessionManager = windowSessionManager;
         _dbManager = dbManager;
     }
 
@@ -48,7 +48,7 @@ public class SystemStateTracker
         if (reason == WTS_SESSION_LOCK)
         {
             _logger.LogInformation("System Locked.");
-            _windowTracker.CloseCurrentSession(now);
+            _windowSessionManager.CloseCurrentSession(now);
 
             var record = new EventRecord
             {
@@ -67,7 +67,7 @@ public class SystemStateTracker
                 _dbManager.UpdateEventEndTime(_lockSessionId.Value, now.ToUnixTimeSeconds());
                 _lockSessionId = null;
             }
-            _windowTracker.ForceReevaluate();
+            _windowSessionManager.ForceReevaluate();
         }
     }
 
@@ -76,12 +76,12 @@ public class SystemStateTracker
         if (eventType == PBT_APMSUSPEND)
         {
             _logger.LogInformation("System Suspending.");
-            _windowTracker.CloseCurrentSession(DateTimeOffset.UtcNow);
+            _windowSessionManager.CloseCurrentSession(DateTimeOffset.UtcNow);
         }
         else if (eventType == PBT_APMRESUMEAUTOMATIC)
         {
             _logger.LogInformation("System Resumed.");
-            _windowTracker.ForceReevaluate();
+            _windowSessionManager.ForceReevaluate();
         }
     }
 

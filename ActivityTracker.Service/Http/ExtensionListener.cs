@@ -16,7 +16,7 @@ public class ExtensionListener
 {
     private readonly ILogger _logger;
     private readonly DatabaseManager _dbManager;
-    private readonly WindowTracker _windowTracker;
+    private readonly WindowSessionManager _windowSessionManager;
     private readonly TrackerConfig _config;
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
@@ -31,11 +31,11 @@ public class ExtensionListener
 
     private readonly object _sessionLock = new();
 
-    public ExtensionListener(ILogger logger, DatabaseManager dbManager, WindowTracker windowTracker)
+    public ExtensionListener(ILogger logger, DatabaseManager dbManager, WindowSessionManager windowSessionManager)
     {
         _logger = logger;
         _dbManager = dbManager;
-        _windowTracker = windowTracker;
+        _windowSessionManager = windowSessionManager;
         _config = ConfigManager.Load();
     }
 
@@ -157,6 +157,21 @@ public class ExtensionListener
                 return;
             }
 
+            if (context.Request.Url!.AbsolutePath == "/window" && context.Request.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(context.Request.InputStream);
+                var body = await reader.ReadToEndAsync();
+
+                var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.WindowEventPayload);
+                if (payload != null)
+                {
+                    _windowSessionManager.HandleWindowChange(payload.ProcessOrDomain, payload.Title);
+                }
+
+                context.Response.StatusCode = 200;
+                return;
+            }
+
             context.Response.StatusCode = 404;
         }
         catch (Exception ex)
@@ -236,12 +251,12 @@ public class ExtensionListener
             _logger.LogInformation($"SessionAgent reports idle ({payload.IdleSeconds:F0}s).");
             // Backdate the session end to when input actually stopped
             var endTime = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
-            _windowTracker.CloseCurrentSession(endTime);
+            _windowSessionManager.CloseCurrentSession(endTime);
         }
         else if (payload.State == "active")
         {
             _logger.LogInformation("SessionAgent reports user active.");
-            _windowTracker.ForceReevaluate();
+            _windowSessionManager.ForceReevaluate();
         }
     }
 
@@ -283,4 +298,10 @@ public class ExtensionEventPayload
     public bool Audible { get; set; }
     public bool IsAudioOnly { get; set; } // True if this event is just a background audio change
     public bool IsAudioStop { get; set; } // True if audio stopped
+}
+
+public class WindowEventPayload
+{
+    public string ProcessOrDomain { get; set; } = "";
+    public string Title { get; set; } = "";
 }

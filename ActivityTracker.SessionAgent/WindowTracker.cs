@@ -1,49 +1,42 @@
 using System;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
-using Microsoft.Extensions.Logging;
-using ActivityTracker.Core.Data;
-using ActivityTracker.Core.Models;
+using System.Threading.Tasks;
 using ActivityTracker.Core.Configuration;
 
-namespace ActivityTracker.Service.Tracking;
+namespace ActivityTracker.SessionAgent;
 
-public partial class WindowTracker
+public class WindowTracker
 {
-    private readonly ILogger _logger;
-    private readonly DatabaseManager _dbManager;
-    private TrackerConfig _config;
-
+    private readonly TrackerConfig _config;
+    private readonly HttpClient _httpClient = new();
+    
     private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
     private WinEventDelegate? _dele;
     private IntPtr _hook;
-
     private IntPtr _msgHwnd = IntPtr.Zero;
 
     private const uint EVENT_SYSTEM_FOREGROUND = 3;
     private const uint WINEVENT_OUTOFCONTEXT = 0;
 
-    internal Action<IntPtr>? OnWtsSessionChange;
-
-    private const string WndClassName = "ActivityTrackerMsgWnd";
+    private const string WndClassName = "ActivityTrackerSessionAgentWnd";
     private WndProcDelegate? _wndProcDelegate;
 
-    private readonly object _sessionLock = new();
-    private long? _currentSessionId;
-    private DateTimeOffset _currentSessionStartTime;
+    private string _lastReportedProcess = "";
+    private string _lastReportedTitle = "";
 
-    public WindowTracker(ILogger logger, DatabaseManager dbManager)
+    public WindowTracker(TrackerConfig config)
     {
-        _logger = logger;
-        _dbManager = dbManager;
-        _config = ConfigManager.Load();
+        _config = config;
     }
 
     public void Start()
     {
-        _logger.LogInformation("Starting Window Tracker...");
+        FileLogger.LogInfo("Starting Window Tracker in SessionAgent...");
         _dele = new WinEventDelegate(WinEventProc);
 
         var windowReady = new ManualResetEventSlim(false);
@@ -61,7 +54,7 @@ public partial class WindowTracker
             RegisterClassEx(ref wndClass);
 
             _msgHwnd = CreateWindowEx(
-                0, WndClassName, "ActivityTrackerMsg",
+                0, WndClassName, "ActivityTrackerSessionAgent",
                 0, 0, 0, 0, 0,
                 HWND_MESSAGE, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
 
@@ -71,11 +64,11 @@ public partial class WindowTracker
             if (_hook == IntPtr.Zero)
             {
                 int error = Marshal.GetLastWin32Error();
-                _logger.LogError($"SetWinEventHook FAILED. Win32 error code: {error}");
+                FileLogger.LogError($"SetWinEventHook FAILED. Win32 error code: {error}");
             }
             else
             {
-                _logger.LogInformation("SetWinEventHook succeeded, hook registered.");
+                FileLogger.LogInfo("SetWinEventHook succeeded, hook registered.");
             }
             
             // Standard Win32 message pump
@@ -95,8 +88,6 @@ public partial class WindowTracker
         LogForegroundWindow(GetForegroundWindow());
     }
 
-    public IntPtr GetMessageWindowHandle() => _msgHwnd;
-
     public void Stop()
     {
         if (_hook != IntPtr.Zero)
@@ -108,8 +99,7 @@ public partial class WindowTracker
         {
             PostMessage(_msgHwnd, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         }
-        CloseCurrentSession();
-        _logger.LogInformation("Window Tracker stopped.");
+        FileLogger.LogInfo("Window Tracker stopped.");
     }
 
     private void WinEventProc(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
@@ -119,88 +109,46 @@ public partial class WindowTracker
 
     private IntPtr MsgWndProc(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
-        if (msg == WM_WTSSESSION_CHANGE)
-        {
-            OnWtsSessionChange?.Invoke(wParam);
-            return IntPtr.Zero;
-        }
         return DefWindowProc(hwnd, msg, wParam, lParam);
-    }
-
-    public void ForceReevaluate()
-    {
-        lock (_sessionLock)
-        {
-            LogForegroundWindow(GetForegroundWindow());
-        }
     }
 
     private void LogForegroundWindow(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return;
 
-        // Gather window info outside the lock — P/Invoke + process
-        // lookup can block and don't touch session state.
         GetWindowThreadProcessId(hwnd, out uint pid);
         var processName = GetProcessName(pid);
         var title = GetWindowTitle(hwnd);
 
         if (ShouldIgnore(processName)) return;
 
-        lock (_sessionLock)
-        {
-            CloseCurrentSessionLocked();
+        // Debounce duplicates
+        if (_lastReportedProcess == processName && _lastReportedTitle == title)
+            return;
 
-            var now = DateTimeOffset.UtcNow;
-            var record = new EventRecord
+        _lastReportedProcess = processName;
+        _lastReportedTitle = title;
+
+        var payload = new WindowEventPayload
+        {
+            ProcessOrDomain = processName,
+            Title = title
+        };
+
+        var json = JsonSerializer.Serialize(payload, WindowEventPayloadContext.Default.WindowEventPayload);
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        _ = Task.Run(async () =>
+        {
+            try
             {
-                Type = "window",
-                ProcessOrDomain = processName,
-                Title = title,
-                StartTime = now.ToUnixTimeSeconds()
-            };
-
-            _currentSessionId = _dbManager.InsertEvent(record);
-            _currentSessionStartTime = now;
-
-            _logger.LogInformation($"Foreground changed: {processName} - {title}");
-        }
-    }
-
-    public void CloseCurrentSession(DateTimeOffset? endTime = null)
-    {
-        lock (_sessionLock)
-        {
-            CloseCurrentSessionLocked(endTime);
-        }
-    }
-
-    /// <summary>
-    /// Core close logic — caller MUST already hold <see cref="_sessionLock"/>.
-    /// </summary>
-    private void CloseCurrentSessionLocked(DateTimeOffset? endTime = null)
-    {
-        if (_currentSessionId.HasValue)
-        {
-            var end = endTime ?? DateTimeOffset.UtcNow;
-
-            // Defensive check: discard sessions with negative duration,
-            // which indicate a prior race slipped through or a clock anomaly.
-            if (end < _currentSessionStartTime)
-            {
-                _logger.LogWarning(
-                    "Negative-duration session detected and discarded. " +
-                    "SessionId={SessionId}, StartTime={StartTime}, EndTime={EndTime}",
-                    _currentSessionId.Value,
-                    _currentSessionStartTime.ToString("o"),
-                    end.ToString("o"));
-                _currentSessionId = null;
-                return;
+                await _httpClient.PostAsync($"http://127.0.0.1:{_config.HttpPort}/window", content);
             }
-
-            _dbManager.UpdateEventEndTime(_currentSessionId.Value, end.ToUnixTimeSeconds());
-            _currentSessionId = null;
-        }
+            catch (Exception ex)
+            {
+                FileLogger.LogError($"Failed to post window event: {ex.Message}");
+            }
+        });
     }
 
     private static string NormalizeProcessName(string name)
@@ -244,8 +192,6 @@ public partial class WindowTracker
     }
 
     private const uint WM_QUIT = 0x0012;
-    private const uint WM_WTSSESSION_CHANGE = 0x02B1;
-    private const uint WM_POWERBROADCAST = 0x0218;
     private static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
     [DllImport("user32.dll", SetLastError = true)]
