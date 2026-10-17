@@ -62,22 +62,8 @@ public class ExtensionListener
         _cts?.Cancel();
         _listener?.Stop();
         
-        // Close all browser sessions
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        lock (_sessionLock)
-        {
-            foreach (var sessionId in _currentBrowserSessions.Values)
-            {
-                _dbManager.UpdateEventEndTime(sessionId, now);
-            }
-            _currentBrowserSessions.Clear();
-
-            foreach (var sessionId in _currentAudioSessions.Values)
-            {
-                _dbManager.UpdateEventEndTime(sessionId, now);
-            }
-            _currentAudioSessions.Clear();
-        }
+        // Close all browser and audio sessions up to now
+        CloseAllBrowserAndAudioSessions(DateTimeOffset.UtcNow);
         
         _logger.LogInformation("HTTP Listener stopped.");
     }
@@ -156,6 +142,27 @@ public class ExtensionListener
                 context.Response.StatusCode = 200;
                 return;
             }
+            // New endpoint to blur a specific browser
+            if (context.Request.Url!.AbsolutePath == "/blur" && context.Request.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(context.Request.InputStream);
+                var body = await reader.ReadToEndAsync();
+                var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.BlurEventPayload);
+                if (payload != null && !string.IsNullOrEmpty(payload.Browser))
+                {
+                    lock (_sessionLock)
+                    {
+                        if (_currentBrowserSessions.TryGetValue(payload.Browser, out var sessId))
+                        {
+                            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                            _dbManager.UpdateEventEndTime(sessId, nowUnix);
+                            _currentBrowserSessions.Remove(payload.Browser);
+                        }
+                    }
+                }
+                context.Response.StatusCode = 200;
+                return;
+            }
 
             if (context.Request.Url!.AbsolutePath == "/window" && context.Request.HttpMethod == "POST")
             {
@@ -222,6 +229,12 @@ public class ExtensionListener
                 var key = (payload.Browser, domain);
                 if (payload.Audible && !payload.IsAudioStop)
                 {
+                    // If an audio session already exists for this (browser, domain), close it first
+                    if (_currentAudioSessions.TryGetValue(key, out var existingId))
+                    {
+                        _dbManager.UpdateEventEndTime(existingId, now);
+                        _currentAudioSessions.Remove(key);
+                    }
                     var audioRecord = new EventRecord
                     {
                         Type = "audio",
