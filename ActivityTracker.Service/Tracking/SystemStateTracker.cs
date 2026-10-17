@@ -51,7 +51,8 @@ public class SystemStateTracker
         {
             _logger.LogInformation("System Locked.");
             _windowSessionManager.CloseCurrentSession(now);
-            _extensionListener.CloseAllBrowserAndAudioSessions(now);
+            // Audio sessions (podcasts, YouTube) are intentionally left running while locked.
+            _extensionListener.CloseAllBrowserSessions(now);
 
             var record = new EventRecord
             {
@@ -81,6 +82,7 @@ public class SystemStateTracker
             _logger.LogInformation("System Suspending.");
             var now = DateTimeOffset.UtcNow;
             _windowSessionManager.CloseCurrentSession(now);
+            // On suspend close everything including audio.
             _extensionListener.CloseAllBrowserAndAudioSessions(now);
         }
         else if (eventType == PBT_APMRESUMEAUTOMATIC)

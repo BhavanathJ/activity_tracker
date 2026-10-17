@@ -69,10 +69,11 @@ public class ExtensionListener
     }
 
     /// <summary>
-    /// Closes every open browser and audio session, setting their end_time to <paramref name="endTime"/>.
+    /// Closes every open browser (focus) session, setting end_time to <paramref name="endTime"/>.
+    /// Audio sessions are left open intentionally (background playback continues while idle/locked).
     /// Safe to call from any thread; acquires _sessionLock internally.
     /// </summary>
-    public void CloseAllBrowserAndAudioSessions(DateTimeOffset endTime)
+    public void CloseAllBrowserSessions(DateTimeOffset endTime)
     {
         var endUnix = endTime.ToUnixTimeSeconds();
         lock (_sessionLock)
@@ -82,13 +83,33 @@ public class ExtensionListener
                 _dbManager.UpdateEventEndTime(sessionId, endUnix);
             }
             _currentBrowserSessions.Clear();
+        }
+    }
 
+    /// <summary>
+    /// Closes every open audio session, setting end_time to <paramref name="endTime"/>.
+    /// Safe to call from any thread; acquires _sessionLock internally.
+    /// </summary>
+    public void CloseAllAudioSessions(DateTimeOffset endTime)
+    {
+        var endUnix = endTime.ToUnixTimeSeconds();
+        lock (_sessionLock)
+        {
             foreach (var sessionId in _currentAudioSessions.Values)
             {
                 _dbManager.UpdateEventEndTime(sessionId, endUnix);
             }
             _currentAudioSessions.Clear();
         }
+    }
+
+    /// <summary>
+    /// Closes every open browser and audio session. Use on suspend or shutdown.
+    /// </summary>
+    public void CloseAllBrowserAndAudioSessions(DateTimeOffset endTime)
+    {
+        CloseAllBrowserSessions(endTime);
+        CloseAllAudioSessions(endTime);
     }
 
     private async Task ListenAsync(CancellationToken token)
@@ -303,9 +324,10 @@ public class ExtensionListener
         {
             _logger.LogInformation($"SessionAgent reports idle ({payload.IdleSeconds:F0}s).");
             // Backdate the session end to when input actually stopped.
+            // Audio sessions (podcasts, YouTube) are intentionally left open while idle.
             var endTime = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
             _windowSessionManager.CloseCurrentSession(endTime);
-            CloseAllBrowserAndAudioSessions(endTime);
+            CloseAllBrowserSessions(endTime);
         }
         else if (payload.State == "active")
         {

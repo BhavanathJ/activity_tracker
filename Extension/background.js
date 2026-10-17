@@ -6,6 +6,10 @@ let includeDomains = [];
 let excludeDomains = [];
 let activeTabId = null;
 
+// Tracks the last known state of every tab so we can fire cleanup events on removal.
+// Map<tabId, { url: string, title: string, audible: boolean }>
+const tabState = new Map();
+
 // ---------- Config ----------
 
 async function fetchConfig() {
@@ -120,6 +124,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeTabId);
     if (tab && tab.url && tab.url.startsWith('http')) {
+      tabState.set(tab.id, { url: tab.url, title: tab.title, audible: tab.audible });
       await sendEvent(tab.url, tab.title, tab.audible);
     }
   } catch (_) {}
@@ -129,6 +134,11 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!tab.url || !tab.url.startsWith('http')) return;
+
+  // Update stored state.
+  const prev = tabState.get(tabId) ?? { url: tab.url, title: tab.title, audible: false };
+  const next = { url: tab.url, title: tab.title, audible: tab.audible };
+  tabState.set(tabId, next);
 
   if (tabId === activeTabId) {
     // Active tab: report focus events AND audible changes.
@@ -144,5 +154,14 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (changeInfo.audible !== undefined) {
       await sendEvent(tab.url, tab.title, changeInfo.audible, true, !changeInfo.audible);
     }
+  }
+});
+
+// When a tab is closed, stop any in-progress audio session it was producing.
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const state = tabState.get(tabId);
+  tabState.delete(tabId);
+  if (state && state.audible && state.url && state.url.startsWith('http')) {
+    await sendEvent(state.url, state.title, false, true, true);
   }
 });
