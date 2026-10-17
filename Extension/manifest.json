@@ -5,7 +5,8 @@
   "description": "Tracks active tabs and audio for the local Activity Tracker service.",
   "permissions": [
     "tabs",
-    "activeTab"
+    "activeTab",
+    "idle"
   ],
   "host_permissions": [
     "http://127.0.0.1/*"

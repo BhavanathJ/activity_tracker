@@ -20,11 +20,11 @@ public class ExtensionListener
     private readonly TrackerConfig _config;
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
-    
+
     // Store ongoing browser sessions to update their end times
     // Key: browser identifier
     private readonly System.Collections.Generic.Dictionary<string, long> _currentBrowserSessions = new();
-    
+
     // Store ongoing audio sessions
     // Key: (browser, domain)
     private readonly System.Collections.Generic.Dictionary<(string, string), long> _currentAudioSessions = new();
@@ -44,7 +44,7 @@ public class ExtensionListener
         _logger.LogInformation($"Starting HTTP Listener on port {_config.HttpPort}...");
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://127.0.0.1:{_config.HttpPort}/");
-        
+
         try
         {
             _listener.Start();
@@ -61,11 +61,34 @@ public class ExtensionListener
     {
         _cts?.Cancel();
         _listener?.Stop();
-        
+
         // Close all browser and audio sessions up to now
         CloseAllBrowserAndAudioSessions(DateTimeOffset.UtcNow);
-        
+
         _logger.LogInformation("HTTP Listener stopped.");
+    }
+
+    /// <summary>
+    /// Closes every open browser and audio session, setting their end_time to <paramref name="endTime"/>.
+    /// Safe to call from any thread; acquires _sessionLock internally.
+    /// </summary>
+    public void CloseAllBrowserAndAudioSessions(DateTimeOffset endTime)
+    {
+        var endUnix = endTime.ToUnixTimeSeconds();
+        lock (_sessionLock)
+        {
+            foreach (var sessionId in _currentBrowserSessions.Values)
+            {
+                _dbManager.UpdateEventEndTime(sessionId, endUnix);
+            }
+            _currentBrowserSessions.Clear();
+
+            foreach (var sessionId in _currentAudioSessions.Values)
+            {
+                _dbManager.UpdateEventEndTime(sessionId, endUnix);
+            }
+            _currentAudioSessions.Clear();
+        }
     }
 
     private async Task ListenAsync(CancellationToken token)
@@ -117,13 +140,13 @@ public class ExtensionListener
             {
                 using var reader = new StreamReader(context.Request.InputStream);
                 var body = await reader.ReadToEndAsync();
-                
+
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.ExtensionEventPayload);
                 if (payload != null)
                 {
                     HandleBrowserEvent(payload);
                 }
-                
+
                 context.Response.StatusCode = 200;
                 return;
             }
@@ -142,7 +165,8 @@ public class ExtensionListener
                 context.Response.StatusCode = 200;
                 return;
             }
-            // New endpoint to blur a specific browser
+
+            // Endpoint to blur a specific browser (close its active session)
             if (context.Request.Url!.AbsolutePath == "/blur" && context.Request.HttpMethod == "POST")
             {
                 using var reader = new StreamReader(context.Request.InputStream);
@@ -150,11 +174,11 @@ public class ExtensionListener
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.BlurEventPayload);
                 if (payload != null && !string.IsNullOrEmpty(payload.Browser))
                 {
+                    var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                     lock (_sessionLock)
                     {
                         if (_currentBrowserSessions.TryGetValue(payload.Browser, out var sessId))
                         {
-                            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                             _dbManager.UpdateEventEndTime(sessId, nowUnix);
                             _currentBrowserSessions.Remove(payload.Browser);
                         }
@@ -195,15 +219,31 @@ public class ExtensionListener
     private void HandleBrowserEvent(ExtensionEventPayload payload)
     {
         if (string.IsNullOrEmpty(payload.Browser) || string.IsNullOrEmpty(payload.Url)) return;
-        
+
         var domain = GetDomainFromUrl(payload.Url);
-        if (ShouldIgnoreDomain(domain)) return;
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
+        // If the domain is ignored, still close the previous browser session before returning.
+        if (ShouldIgnoreDomain(domain))
+        {
+            if (!payload.IsAudioOnly)
+            {
+                lock (_sessionLock)
+                {
+                    if (_currentBrowserSessions.TryGetValue(payload.Browser, out var prevId))
+                    {
+                        _dbManager.UpdateEventEndTime(prevId, now);
+                        _currentBrowserSessions.Remove(payload.Browser);
+                    }
+                }
+            }
+            return;
+        }
+
         lock (_sessionLock)
         {
-            // If it's a focus event, close the previous session for this browser
+            // Focus event: close the previous session for this browser and open a new one.
             if (!payload.IsAudioOnly)
             {
                 if (_currentBrowserSessions.TryGetValue(payload.Browser, out var prevSessionId))
@@ -219,17 +259,17 @@ public class ExtensionListener
                     Title = payload.Title ?? "",
                     StartTime = now
                 };
-                
+
                 _currentBrowserSessions[payload.Browser] = _dbManager.InsertEvent(record);
             }
-            
-            // Handle Audio
+
+            // Audio event (active tab or background tab).
             if (payload.IsAudioOnly)
             {
                 var key = (payload.Browser, domain);
                 if (payload.Audible && !payload.IsAudioStop)
                 {
-                    // If an audio session already exists for this (browser, domain), close it first
+                    // If an audio session already exists for this (browser, domain), close it first.
                     if (_currentAudioSessions.TryGetValue(key, out var existingId))
                     {
                         _dbManager.UpdateEventEndTime(existingId, now);
@@ -262,13 +302,15 @@ public class ExtensionListener
         if (payload.State == "idle")
         {
             _logger.LogInformation($"SessionAgent reports idle ({payload.IdleSeconds:F0}s).");
-            // Backdate the session end to when input actually stopped
+            // Backdate the session end to when input actually stopped.
             var endTime = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
             _windowSessionManager.CloseCurrentSession(endTime);
+            CloseAllBrowserAndAudioSessions(endTime);
         }
         else if (payload.State == "active")
         {
             _logger.LogInformation("SessionAgent reports user active.");
+            // Do not reopen browser sessions here; the extension re-sends the active tab.
             _windowSessionManager.ForceReevaluate();
         }
     }
@@ -309,7 +351,7 @@ public class ExtensionEventPayload
     public string Url { get; set; } = "";
     public string Title { get; set; } = "";
     public bool Audible { get; set; }
-    public bool IsAudioOnly { get; set; } // True if this event is just a background audio change
+    public bool IsAudioOnly { get; set; } // True if this event is just an audio change (not a focus change)
     public bool IsAudioStop { get; set; } // True if audio stopped
 }
 
@@ -317,4 +359,9 @@ public class WindowEventPayload
 {
     public string ProcessOrDomain { get; set; } = "";
     public string Title { get; set; } = "";
+}
+
+public class BlurEventPayload
+{
+    public string Browser { get; set; } = "";
 }

@@ -126,7 +126,7 @@ public class ReportCommand : Command<ReportCommand.Settings>
             var startTime = reader.GetInt64(3);
             var endTime = reader.IsDBNull(4) ? (long?)null : reader.GetInt64(4);
 
-            var effectiveEnd = endTime ?? nowUnix;
+            var effectiveEnd = endTime.HasValue ? endTime.Value : Math.Min(nowUnix, startTime + 300);
             var duration = effectiveEnd - startTime;
 
             var startDto = DateTimeOffset.FromUnixTimeSeconds(startTime).ToLocalTime();
@@ -174,7 +174,8 @@ public class ReportCommand : Command<ReportCommand.Settings>
         using var conn = dbManager.GetConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-            SELECT type, process_or_domain, browser, SUM(COALESCE(end_time, @now) - start_time) 
+            SELECT type, process_or_domain, browser,
+                   SUM(MIN(COALESCE(end_time, @now), start_time + 300) - start_time)
             FROM events
             WHERE start_time >= @start AND start_time < @end
             GROUP BY type, process_or_domain, browser;
