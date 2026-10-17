@@ -224,6 +224,21 @@ public class ExtensionListener
                 return;
             }
 
+            if (context.Request.Url!.AbsolutePath == "/audio-sync" && context.Request.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(context.Request.InputStream);
+                var body = await reader.ReadToEndAsync();
+
+                var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.AudioSyncPayload);
+                if (payload != null && !string.IsNullOrEmpty(payload.Browser))
+                {
+                    HandleAudioSync(payload);
+                }
+
+                context.Response.StatusCode = 200;
+                return;
+            }
+
             context.Response.StatusCode = 404;
         }
         catch (Exception ex)
@@ -337,6 +352,52 @@ public class ExtensionListener
         }
     }
 
+    private void HandleAudioSync(AudioSyncPayload payload)
+    {
+        // Build a set of the domains the browser says are currently audible.
+        var activeDomains = new System.Collections.Generic.HashSet<string>(
+            payload.Domains ?? System.Array.Empty<string>(),
+            StringComparer.OrdinalIgnoreCase);
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        lock (_sessionLock)
+        {
+            // 1. Close sessions for domains no longer audible in this browser.
+            var toClose = new System.Collections.Generic.List<(string, string)>();
+            foreach (var key in _currentAudioSessions.Keys)
+            {
+                if (key.Item1 == payload.Browser && !activeDomains.Contains(key.Item2))
+                    toClose.Add(key);
+            }
+            foreach (var key in toClose)
+            {
+                _dbManager.UpdateEventEndTime(_currentAudioSessions[key], now);
+                _currentAudioSessions.Remove(key);
+            }
+
+            // 2. Open sessions for domains that are audible but have no open session.
+            foreach (var domain in activeDomains)
+            {
+                if (ShouldIgnoreDomain(domain)) continue;
+                var key = (payload.Browser, domain);
+                if (!_currentAudioSessions.ContainsKey(key))
+                {
+                    var record = new EventRecord
+                    {
+                        Type = "audio",
+                        ProcessOrDomain = domain,
+                        Browser = payload.Browser,
+                        Title = "",
+                        StartTime = now
+                    };
+                    _currentAudioSessions[key] = _dbManager.InsertEvent(record);
+                }
+                // Existing session: leave it open (do not close/reopen).
+            }
+        }
+    }
+
     private string GetDomainFromUrl(string urlStr)
     {
         if (Uri.TryCreate(urlStr, UriKind.Absolute, out var uri))
@@ -386,4 +447,10 @@ public class WindowEventPayload
 public class BlurEventPayload
 {
     public string Browser { get; set; } = "";
+}
+
+public class AudioSyncPayload
+{
+    public string Browser { get; set; } = "";
+    public string[] Domains { get; set; } = System.Array.Empty<string>();
 }

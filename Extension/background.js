@@ -1,14 +1,11 @@
 import { BROWSER_ID, CONFIG_URL, EVENT_URL } from './config.js';
 
 const BLUR_URL = EVENT_URL.replace('/event', '/blur');
+const AUDIO_SYNC_URL = EVENT_URL.replace('/event', '/audio-sync');
 
 let includeDomains = [];
 let excludeDomains = [];
 let activeTabId = null;
-
-// Tracks the last known state of every tab so we can fire cleanup events on removal.
-// Map<tabId, { url: string, title: string, audible: boolean }>
-const tabState = new Map();
 
 // ---------- Config ----------
 
@@ -59,6 +56,26 @@ async function sendBlur() {
   } catch (_) {}
 }
 
+// Query all currently audible tabs, map to hostnames, and POST /audio-sync.
+// The service will close stale sessions and open new ones as needed.
+async function sendAudioSync() {
+  try {
+    const tabs = await chrome.tabs.query({ audible: true });
+    const domains = tabs
+      .filter(t => t.url && t.url.startsWith('http'))
+      .map(t => {
+        try { return new URL(t.url).hostname; } catch (_) { return null; }
+      })
+      .filter(Boolean);
+
+    await fetch(AUDIO_SYNC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ Browser: BROWSER_ID, Domains: domains })
+    });
+  } catch (_) {}
+}
+
 // ---------- Active-tab helpers ----------
 
 async function sendActiveTab() {
@@ -82,16 +99,9 @@ async function sendActiveTabOfWindow(windowId) {
 }
 
 // ---------- Service-worker startup ----------
-// Send audio-start for every currently audible tab.
+// Sync current audible state so the service starts clean after a SW restart.
 (async () => {
-  try {
-    const audibleTabs = await chrome.tabs.query({ audible: true });
-    for (const tab of audibleTabs) {
-      if (tab.url && tab.url.startsWith('http')) {
-        await sendEvent(tab.url, tab.title, true, true, false);
-      }
-    }
-  } catch (_) {}
+  await sendAudioSync();
 })();
 
 // Set idle detection interval to 60 seconds.
@@ -124,7 +134,6 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeTabId);
     if (tab && tab.url && tab.url.startsWith('http')) {
-      tabState.set(tab.id, { url: tab.url, title: tab.title, audible: tab.audible });
       await sendEvent(tab.url, tab.title, tab.audible);
     }
   } catch (_) {}
@@ -135,33 +144,26 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (!tab.url || !tab.url.startsWith('http')) return;
 
-  // Update stored state.
-  const prev = tabState.get(tabId) ?? { url: tab.url, title: tab.title, audible: false };
-  const next = { url: tab.url, title: tab.title, audible: tab.audible };
-  tabState.set(tabId, next);
-
   if (tabId === activeTabId) {
     // Active tab: report focus events AND audible changes.
     if (changeInfo.url || changeInfo.title) {
       await sendEvent(tab.url, tab.title, tab.audible);
     } else if (changeInfo.audible !== undefined) {
-      // Active tab toggled audio: use IsAudioOnly so the server opens/closes an audio session
-      // without replacing the browser (focus) session.
-      await sendEvent(tab.url, tab.title, changeInfo.audible, true, !changeInfo.audible);
+      // Active tab toggled audio: sync the full audible set.
+      await sendAudioSync();
     }
   } else {
     // Background tab: only care about audible changes.
     if (changeInfo.audible !== undefined) {
-      await sendEvent(tab.url, tab.title, changeInfo.audible, true, !changeInfo.audible);
+      await sendAudioSync();
     }
   }
 });
 
-// When a tab is closed, stop any in-progress audio session it was producing.
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const state = tabState.get(tabId);
-  tabState.delete(tabId);
-  if (state && state.audible && state.url && state.url.startsWith('http')) {
-    await sendEvent(state.url, state.title, false, true, true);
-  }
+// ---------- Tab removal ----------
+// Re-sync the audible set; the removed tab won't appear in the query,
+// so the service will close its session automatically if it was audible.
+
+chrome.tabs.onRemoved.addListener(async () => {
+  await sendAudioSync();
 });

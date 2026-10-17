@@ -7,6 +7,7 @@ namespace ActivityTracker.Service.Http;
 [JsonSerializable(typeof(IdleEventPayload))]
 [JsonSerializable(typeof(WindowEventPayload))]
 [JsonSerializable(typeof(BlurEventPayload))]
+[JsonSerializable(typeof(AudioSyncPayload))]
 [JsonSerializable(typeof(TrackerConfig))]
 internal partial class ServiceJsonContext : JsonSerializerContext
 {
