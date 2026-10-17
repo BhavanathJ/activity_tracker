@@ -104,6 +104,17 @@ async function sendActiveTabOfWindow(windowId) {
   await sendAudioSync();
 })();
 
+// ---------- Audio heartbeat (every 30 s) ----------
+// chrome.alarms keeps the service worker alive and provides a reliable 30 s tick
+// so the service can detect dead browsers via the 90 s stale threshold.
+const AUDIO_HEARTBEAT_ALARM = 'audio-heartbeat';
+chrome.alarms.create(AUDIO_HEARTBEAT_ALARM, { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === AUDIO_HEARTBEAT_ALARM) {
+    sendAudioSync();
+  }
+});
+
 // Set idle detection interval to 60 seconds.
 chrome.idle.setDetectionInterval(60);
 

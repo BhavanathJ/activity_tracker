@@ -31,6 +31,10 @@ public class ExtensionListener
 
     private readonly object _sessionLock = new();
 
+    // Tracks the last time /audio-sync was received per browser (unix seconds).
+    // Used to expire audio sessions whose browser has gone silent.
+    private readonly System.Collections.Generic.Dictionary<string, long> _lastAudioSyncUnix = new();
+
     public ExtensionListener(ILogger logger, DatabaseManager dbManager, WindowSessionManager windowSessionManager)
     {
         _logger = logger;
@@ -50,6 +54,7 @@ public class ExtensionListener
             _listener.Start();
             _cts = new CancellationTokenSource();
             _ = Task.Run(() => ListenAsync(_cts.Token));
+            _ = Task.Run(() => ExpireStaleAudioSessionsLoopAsync(_cts.Token));
         }
         catch (Exception ex)
         {
@@ -110,6 +115,56 @@ public class ExtensionListener
     {
         CloseAllBrowserSessions(endTime);
         CloseAllAudioSessions(endTime);
+    }
+
+    /// <summary>
+    /// Runs every 30 s. Closes audio sessions for any browser whose last /audio-sync
+    /// was received more than 90 s ago (browser dead / SW unloaded), using lastSyncUnix
+    /// as the end_time so the session ends when the browser was last heard from.
+    /// </summary>
+    private async Task ExpireStaleAudioSessionsLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(30), token); }
+            catch (OperationCanceledException) { break; }
+
+            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            const long StaleThresholdSeconds = 90;
+
+            lock (_sessionLock)
+            {
+                var staleBrowsers = new System.Collections.Generic.List<string>();
+                foreach (var kv in _lastAudioSyncUnix)
+                {
+                    if (nowUnix - kv.Value > StaleThresholdSeconds)
+                        staleBrowsers.Add(kv.Key);
+                }
+
+                foreach (var browser in staleBrowsers)
+                {
+                    var lastSync = _lastAudioSyncUnix[browser];
+                    var toClose = new System.Collections.Generic.List<(string, string)>();
+                    foreach (var key in _currentAudioSessions.Keys)
+                    {
+                        if (key.Item1 == browser)
+                            toClose.Add(key);
+                    }
+                    if (toClose.Count > 0)
+                    {
+                        _logger.LogWarning(
+                            "Browser '{Browser}' has not sent audio-sync in {Age}s — closing {Count} stale audio session(s).",
+                            browser, nowUnix - lastSync, toClose.Count);
+                        foreach (var key in toClose)
+                        {
+                            _dbManager.UpdateEventEndTime(_currentAudioSessions[key], lastSync);
+                            _currentAudioSessions.Remove(key);
+                        }
+                    }
+                    _lastAudioSyncUnix.Remove(browser);
+                }
+            }
+        }
     }
 
     private async Task ListenAsync(CancellationToken token)
@@ -363,6 +418,9 @@ public class ExtensionListener
 
         lock (_sessionLock)
         {
+            // Record heartbeat time so the stale-session timer knows this browser is alive.
+            _lastAudioSyncUnix[payload.Browser] = now;
+
             // 1. Close sessions for domains no longer audible in this browser.
             var toClose = new System.Collections.Generic.List<(string, string)>();
             foreach (var key in _currentAudioSessions.Keys)
