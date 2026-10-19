@@ -175,7 +175,7 @@ public class ReportCommand : Command<ReportCommand.Settings>
         using var cmd = conn.CreateCommand();
         cmd.CommandText = @"
             SELECT type, process_or_domain, browser,
-                   SUM(MIN(COALESCE(end_time, @now), start_time + 300) - start_time)
+                   SUM(CASE WHEN end_time IS NULL THEN MIN(@now - start_time, 300) ELSE end_time - start_time END)
             FROM events
             WHERE start_time >= @start AND start_time < @end
             GROUP BY type, process_or_domain, browser;

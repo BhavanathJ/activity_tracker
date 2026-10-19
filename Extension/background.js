@@ -7,6 +7,17 @@ let includeDomains = [];
 let excludeDomains = [];
 let activeTabId = null;
 
+// ---------- Focus guard ----------
+
+async function isBrowserFocused() {
+  try {
+    const w = await chrome.windows.getLastFocused();
+    return !!w && w.focused === true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // ---------- Config ----------
 
 async function fetchConfig() {
@@ -79,6 +90,7 @@ async function sendAudioSync() {
 // ---------- Active-tab helpers ----------
 
 async function sendActiveTab() {
+  if (!(await isBrowserFocused())) return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (tab && tab.url && tab.url.startsWith('http')) {
@@ -89,6 +101,7 @@ async function sendActiveTab() {
 }
 
 async function sendActiveTabOfWindow(windowId) {
+  if (!(await isBrowserFocused())) return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, windowId });
     if (tab && tab.url && tab.url.startsWith('http')) {
@@ -142,6 +155,7 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   activeTabId = activeInfo.tabId;
+  if (!(await isBrowserFocused())) return;
   try {
     const tab = await chrome.tabs.get(activeTabId);
     if (tab && tab.url && tab.url.startsWith('http')) {
@@ -158,6 +172,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (tabId === activeTabId) {
     // Active tab: report focus events AND audible changes.
     if (changeInfo.url || changeInfo.title) {
+      if (!(await isBrowserFocused())) return;
       await sendEvent(tab.url, tab.title, tab.audible);
     } else if (changeInfo.audible !== undefined) {
       // Active tab toggled audio: sync the full audible set.
