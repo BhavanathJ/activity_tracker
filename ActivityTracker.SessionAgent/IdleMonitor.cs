@@ -14,6 +14,8 @@ public class IdleMonitor
     private readonly WindowTracker _windowTracker;
     private Timer? _timer;
     private bool _isIdle = false;
+    private DateTimeOffset _lastPostTime = DateTimeOffset.UtcNow;
+    private readonly object _pollLock = new();
 
     public IdleMonitor(int idleTimeoutSeconds, int httpPort, WindowTracker windowTracker)
     {
@@ -25,7 +27,8 @@ public class IdleMonitor
 
     public void Start()
     {
-        FileLogger.LogInfo($"Idle monitor started (timeout={_idleTimeoutSeconds}s).");
+        FileLogger.LogInfo($"Idle monitor started (timeout={_idleTimeoutSeconds}s, heartbeat=30s).");
+        _lastPostTime = DateTimeOffset.UtcNow;
         _timer = new Timer(CheckIdle, null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
     }
 
@@ -38,43 +41,70 @@ public class IdleMonitor
 
     private void CheckIdle(object? state)
     {
-        var info = new LASTINPUTINFO();
-        info.cbSize = (uint)Marshal.SizeOf(info);
+        if (!Monitor.TryEnter(_pollLock))
+            return;
 
-        if (GetLastInputInfo(ref info))
+        try
         {
-            uint currentTicks = (uint)Environment.TickCount;
-            uint idleTicks = currentTicks - info.dwTime;
-            double idleSeconds = idleTicks / 1000.0;
+            var info = new LASTINPUTINFO();
+            info.cbSize = (uint)Marshal.SizeOf(info);
 
-            if (idleSeconds >= _idleTimeoutSeconds)
+            if (GetLastInputInfo(ref info))
             {
-                if (!_isIdle)
+                uint currentTicks = (uint)Environment.TickCount;
+                uint idleTicks = currentTicks - info.dwTime;
+                double idleSeconds = idleTicks / 1000.0;
+                var now = DateTimeOffset.UtcNow;
+
+                if (idleSeconds >= _idleTimeoutSeconds)
                 {
-                    FileLogger.LogInfo($"Idle detected ({idleSeconds:F0}s >= {_idleTimeoutSeconds}s).");
-                    // Only set _isIdle after a successful POST
-                    if (PostIdleState("idle", idleSeconds))
+                    if (!_isIdle)
                     {
-                        _isIdle = true;
+                        FileLogger.LogInfo($"Idle detected ({idleSeconds:F0}s >= {_idleTimeoutSeconds}s).");
+                        // Only set _isIdle after a successful POST
+                        if (PostIdleState("idle", idleSeconds))
+                        {
+                            _isIdle = true;
+                            _lastPostTime = now;
+                        }
+                        // On failure, retry on the next 5 s tick (don't set _isIdle)
                     }
-                    // On failure, retry on the next 5 s tick (don't set _isIdle)
+                    else if ((now - _lastPostTime) >= TimeSpan.FromSeconds(30))
+                    {
+                        if (PostIdleState("idle", idleSeconds))
+                        {
+                            _lastPostTime = now;
+                        }
+                    }
+                }
+                else
+                {
+                    if (_isIdle)
+                    {
+                        FileLogger.LogInfo("User active again.");
+                        // Only set _isIdle after a successful POST
+                        if (PostIdleState("active", 0))
+                        {
+                            _isIdle = false;
+                            _lastPostTime = now;
+                            // After successful POST of "active", force-report the current window
+                            _windowTracker.ForceReport();
+                        }
+                        // On failure, retry on the next 5 s tick (remain _isIdle = true)
+                    }
+                    else if ((now - _lastPostTime) >= TimeSpan.FromSeconds(30))
+                    {
+                        if (PostIdleState("active", 0))
+                        {
+                            _lastPostTime = now;
+                        }
+                    }
                 }
             }
-            else
-            {
-                if (_isIdle)
-                {
-                    FileLogger.LogInfo("User active again.");
-                    // Only set _isIdle after a successful POST
-                    if (PostIdleState("active", 0))
-                    {
-                        _isIdle = false;
-                        // After successful POST of "active", force-report the current window
-                        _windowTracker.ForceReport();
-                    }
-                    // On failure, retry on the next 5 s tick (remain _isIdle = true)
-                }
-            }
+        }
+        finally
+        {
+            Monitor.Exit(_pollLock);
         }
     }
 

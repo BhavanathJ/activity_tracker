@@ -187,15 +187,12 @@ public class WindowSessionManager
             if (end < _currentSessionStartTime)
             {
                 _logger.LogWarning(
-                    "Negative-duration session detected and discarded. " +
+                    "Negative-duration session detected. Clamping end time to start time. " +
                     "SessionId={SessionId}, StartTime={StartTime}, EndTime={EndTime}",
                     _currentSessionId.Value,
                     _currentSessionStartTime.ToString("o"),
                     end.ToString("o"));
-                _currentSessionId = null;
-                _currentProcess = null;
-                _currentTitle = null;
-                return;
+                end = _currentSessionStartTime;
             }
 
             _dbManager.UpdateEventEndTime(_currentSessionId.Value, end.ToUnixTimeSeconds());

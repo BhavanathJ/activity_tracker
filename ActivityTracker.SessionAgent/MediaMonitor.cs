@@ -77,7 +77,7 @@ public class MediaMonitor
                                     if (pb != null && pb.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
                                     {
                                         string appId = (session.SourceAppUserModelId ?? "").ToLowerInvariant();
-                                        if (appId.Contains(fgLower))
+                                        if (DoesAppIdMatchForeground(appId, fgLower))
                                         {
                                             sessionMatches = true;
                                             break;
@@ -96,11 +96,21 @@ public class MediaMonitor
                         FileLogger.LogWarn($"GSMTC query error: {ex.Message}");
                     }
 
-                    bool isFullscreen = IsForegroundWindowFullscreen(fgHwnd);
-
-                    if (sessionMatches || isFullscreen)
+                    if (sessionMatches)
                     {
                         isPlaying = true;
+                    }
+                    else
+                    {
+                        bool isFullscreen = IsForegroundWindowFullscreen(fgHwnd);
+                        if (isFullscreen)
+                        {
+                            bool hasAudio = CheckAudioPeakAboveThreshold(0.001f);
+                            if (hasAudio)
+                            {
+                                isPlaying = true;
+                            }
+                        }
                     }
                 }
             }
@@ -197,6 +207,170 @@ public class MediaMonitor
                        winRect.Bottom >= mi.rcMonitor.Bottom);
 
         return exact || covers;
+    }
+
+    private static readonly System.Collections.Generic.Dictionary<string, System.Collections.Generic.HashSet<string>> AppAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["brave"] = new(StringComparer.OrdinalIgnoreCase) { "brave", "brave.exe", "bravesoftware.brave" },
+        ["chrome"] = new(StringComparer.OrdinalIgnoreCase) { "chrome", "chrome.exe", "google.chrome" },
+        ["msedge"] = new(StringComparer.OrdinalIgnoreCase) { "msedge", "msedge.exe", "microsoft.microsoftedge", "microsoftedge" },
+        ["spotify"] = new(StringComparer.OrdinalIgnoreCase) { "spotify", "spotify.exe", "spotifyab.spotifymusic" },
+        ["vlc"] = new(StringComparer.OrdinalIgnoreCase) { "vlc", "vlc.exe", "videolan.vlc" }
+    };
+
+    private static bool DoesAppIdMatchForeground(string appId, string fgLower)
+    {
+        if (string.IsNullOrEmpty(appId) || string.IsNullOrEmpty(fgLower))
+            return false;
+
+        // Exact match
+        if (string.Equals(appId, fgLower, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        string appIdNoExe = appId.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? appId[..^4]
+            : appId;
+
+        if (string.Equals(appIdNoExe, fgLower, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Alias map check for brave, chrome, msedge, spotify, vlc
+        if (AppAliases.TryGetValue(fgLower, out var aliases))
+        {
+            if (aliases.Contains(appId) || aliases.Contains(appIdNoExe))
+                return true;
+
+            foreach (var alias in aliases)
+            {
+                if (appId.StartsWith(alias + "_", StringComparison.OrdinalIgnoreCase) ||
+                    appId.StartsWith(alias + ".", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool CheckAudioPeakAboveThreshold(float threshold)
+    {
+        try
+        {
+            var enumeratorType = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
+            if (enumeratorType == null) return false;
+            var enumerator = (IMMDeviceEnumerator?)Activator.CreateInstance(enumeratorType);
+            if (enumerator == null) return false;
+
+            // 0 = eRender, 0 = eConsole (fallback to 1 = eMultimedia)
+            int hr = enumerator.GetDefaultAudioEndpoint(0, 0, out IMMDevice device);
+            if (hr != 0 || device == null)
+            {
+                hr = enumerator.GetDefaultAudioEndpoint(0, 1, out device);
+                if (hr != 0 || device == null)
+                {
+                    Marshal.ReleaseComObject(enumerator);
+                    return false;
+                }
+            }
+
+            Guid iid = typeof(IAudioMeterInformation).GUID;
+            hr = device.Activate(ref iid, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out object meterObj);
+            if (hr != 0 || meterObj is not IAudioMeterInformation meter)
+            {
+                Marshal.ReleaseComObject(device);
+                Marshal.ReleaseComObject(enumerator);
+                return false;
+            }
+
+            try
+            {
+                // Sample 3 times over ~300 ms (0ms, 150ms, 300ms)
+                for (int i = 0; i < 3; i++)
+                {
+                    if (meter.GetPeakValue(out float peak) == 0)
+                    {
+                        if (peak > threshold)
+                            return true;
+                    }
+
+                    if (i < 2)
+                    {
+                        Thread.Sleep(150);
+                    }
+                }
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(meter);
+                Marshal.ReleaseComObject(device);
+                Marshal.ReleaseComObject(enumerator);
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.LogWarn($"Audio peak check error: {ex.Message}");
+            return false;
+        }
+    }
+
+    [ComImport]
+    [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDeviceEnumerator
+    {
+        [PreserveSig]
+        int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+
+        [PreserveSig]
+        int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+
+        [PreserveSig]
+        int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string pwstrId, out IMMDevice ppDevice);
+
+        [PreserveSig]
+        int RegisterEndpointNotificationCallback(IntPtr pClient);
+
+        [PreserveSig]
+        int UnregisterEndpointNotificationCallback(IntPtr pClient);
+    }
+
+    [ComImport]
+    [Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDevice
+    {
+        [PreserveSig]
+        int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+
+        [PreserveSig]
+        int OpenPropertyStore(int stgmAccess, out IntPtr ppProperties);
+
+        [PreserveSig]
+        int GetId(out IntPtr ppstrId);
+
+        [PreserveSig]
+        int GetState(out int pdwState);
+    }
+
+    [ComImport]
+    [Guid("C02216F6-038E-4B54-9D00-D008E73E0064")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioMeterInformation
+    {
+        [PreserveSig]
+        int GetPeakValue(out float pfPeak);
+
+        [PreserveSig]
+        int GetMeteringChannelCount(out uint pnChannelCount);
+
+        [PreserveSig]
+        int GetChannelsPeakValues(uint u32ChannelCount, IntPtr afPeakValues);
+
+        [PreserveSig]
+        int QueryHardwareSupport(out uint pdwHardwareSupportMask);
     }
 
     [StructLayout(LayoutKind.Sequential)]

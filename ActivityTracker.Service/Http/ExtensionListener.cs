@@ -42,8 +42,10 @@ public class ExtensionListener
     private bool _inputIdle;
     private bool _mediaActive;
     private bool _effectiveIdle;
-    private long _lastMediaHeartbeatUnix;
     private DateTimeOffset _lastInputIdleBackdate = DateTimeOffset.UtcNow;
+
+    // Per-source media map: "{Source}:{Process}" -> (bool Playing, long LastSeenUnix)
+    private readonly System.Collections.Generic.Dictionary<string, (bool Playing, long LastSeenUnix)> _mediaSources = new(StringComparer.OrdinalIgnoreCase);
 
     // Last browser event per browser, stored when the browser's process is not foreground
     private readonly System.Collections.Generic.Dictionary<string, (string Domain, string Title, DateTimeOffset Timestamp)> _lastBrowserEvent = new(StringComparer.OrdinalIgnoreCase);
@@ -70,7 +72,6 @@ public class ExtensionListener
     public void Start()
     {
         _cts = new CancellationTokenSource();
-        _lastMediaHeartbeatUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         _ = Task.Run(() => StartWithRetryAsync(_cts.Token));
     }
 
@@ -587,9 +588,15 @@ public class ExtensionListener
     {
         if (payload.State == "idle")
         {
-            _logger.LogInformation($"SessionAgent reports idle ({payload.IdleSeconds:F0}s).");
             lock (_sessionLock)
             {
+                if (_inputIdle)
+                {
+                    // Repeated "idle" report: idempotent, do not re-backdate and do not re-close
+                    return;
+                }
+
+                _logger.LogInformation("SessionAgent reports idle ({IdleSeconds:F0}s).", payload.IdleSeconds);
                 _inputIdle = true;
                 _lastInputIdleBackdate = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
                 ApplyEffectiveIdle(fromMediaChange: false, backdatedTime: _lastInputIdleBackdate);
@@ -597,26 +604,47 @@ public class ExtensionListener
         }
         else if (payload.State == "active")
         {
-            _logger.LogInformation("SessionAgent reports user active.");
             lock (_sessionLock)
             {
+                if (!_inputIdle)
+                {
+                    // Repeated "active" report: idempotent
+                    return;
+                }
+
+                _logger.LogInformation("SessionAgent reports user active.");
                 _inputIdle = false;
                 ApplyEffectiveIdle(fromMediaChange: false);
             }
         }
     }
 
+    private bool RecomputeMediaActiveLocked(long nowUnix)
+    {
+        foreach (var entry in _mediaSources.Values)
+        {
+            if (entry.Playing && (nowUnix - entry.LastSeenUnix) < 90)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void HandleMediaEvent(MediaEventPayload payload)
     {
         lock (_sessionLock)
         {
-            _lastMediaHeartbeatUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            bool newMediaActive = payload.Playing;
+            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var sourceKey = $"{payload.Source}:{payload.Process}";
+            _mediaSources[sourceKey] = (payload.Playing, nowUnix);
+
+            bool newMediaActive = RecomputeMediaActiveLocked(nowUnix);
 
             if (_mediaActive != newMediaActive)
             {
-                _logger.LogInformation("Media state changed: _mediaActive={Playing} (Source={Source}, Process={Process})",
-                    newMediaActive, payload.Source, payload.Process);
+                _logger.LogInformation("Media state changed: _mediaActive={Playing} (triggered by {SourceKey})",
+                    newMediaActive, sourceKey);
                 _mediaActive = newMediaActive;
                 ApplyEffectiveIdle(fromMediaChange: true);
             }
@@ -670,7 +698,8 @@ public class ExtensionListener
     }
 
     /// <summary>
-    /// Auto-expires _mediaActive if no /media heartbeat has arrived for 90 s.
+    /// Runs periodically. Removes stale media entries (>= 90s) and recomputes _mediaActive.
+    /// Calls ApplyEffectiveIdle(fromMediaChange: true) only when the computed value changes.
     /// </summary>
     private async Task ExpireMediaLoopAsync(CancellationToken token)
     {
@@ -681,15 +710,29 @@ public class ExtensionListener
 
             lock (_sessionLock)
             {
-                if (_mediaActive)
+                var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                var staleKeys = new System.Collections.Generic.List<string>();
+                foreach (var kv in _mediaSources)
                 {
-                    var elapsed = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - _lastMediaHeartbeatUnix;
-                    if (elapsed >= 90)
+                    if (nowUnix - kv.Value.LastSeenUnix >= 90)
                     {
-                        _logger.LogWarning("No /media heartbeat received in {Elapsed}s (threshold 90s) — expiring _mediaActive to false.", elapsed);
-                        _mediaActive = false;
-                        ApplyEffectiveIdle(fromMediaChange: true);
+                        staleKeys.Add(kv.Key);
                     }
+                }
+
+                foreach (var key in staleKeys)
+                {
+                    _mediaSources.Remove(key);
+                }
+
+                bool newMediaActive = RecomputeMediaActiveLocked(nowUnix);
+
+                if (_mediaActive != newMediaActive)
+                {
+                    _logger.LogInformation("Media state changed: _mediaActive={MediaActive} after removing {Count} stale media source(s).",
+                        newMediaActive, staleKeys.Count);
+                    _mediaActive = newMediaActive;
+                    ApplyEffectiveIdle(fromMediaChange: true);
                 }
             }
         }
