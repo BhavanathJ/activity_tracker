@@ -33,6 +33,7 @@ public class TrackerServiceBase : ServiceBase
         _host = host;
         CanHandleSessionChangeEvent = true;
         CanHandlePowerEvent = true;
+        CanShutdown = true;
     }
 
     protected override void OnStart(string[] args)
@@ -41,6 +42,11 @@ public class TrackerServiceBase : ServiceBase
     }
 
     protected override void OnStop()
+    {
+        _host.StopAsync().GetAwaiter().GetResult();
+    }
+
+    protected override void OnShutdown()
     {
         _host.StopAsync().GetAwaiter().GetResult();
     }
@@ -60,6 +66,10 @@ public class TrackerServiceBase : ServiceBase
         else if (powerStatus == PowerBroadcastStatus.ResumeAutomatic)
         {
             PowerChangeNotifier.Notify(0x0012); // PBT_APMRESUMEAUTOMATIC
+        }
+        else if (powerStatus == PowerBroadcastStatus.ResumeSuspend)
+        {
+            PowerChangeNotifier.Notify(0x0007); // PBT_APMRESUMESUSPEND
         }
 
         return base.OnPowerEvent(powerStatus);

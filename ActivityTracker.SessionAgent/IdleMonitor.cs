@@ -11,14 +11,16 @@ public class IdleMonitor
     private readonly int _idleTimeoutSeconds;
     private readonly string _serviceUrl;
     private readonly HttpClient _httpClient;
+    private readonly WindowTracker _windowTracker;
     private Timer? _timer;
     private bool _isIdle = false;
 
-    public IdleMonitor(int idleTimeoutSeconds, int httpPort)
+    public IdleMonitor(int idleTimeoutSeconds, int httpPort, WindowTracker windowTracker)
     {
         _idleTimeoutSeconds = idleTimeoutSeconds;
         _serviceUrl = $"http://127.0.0.1:{httpPort}/idle";
         _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        _windowTracker = windowTracker;
     }
 
     public void Start()
@@ -50,8 +52,12 @@ public class IdleMonitor
                 if (!_isIdle)
                 {
                     FileLogger.LogInfo($"Idle detected ({idleSeconds:F0}s >= {_idleTimeoutSeconds}s).");
-                    _isIdle = true;
-                    PostIdleState("idle", idleSeconds);
+                    // Only set _isIdle after a successful POST
+                    if (PostIdleState("idle", idleSeconds))
+                    {
+                        _isIdle = true;
+                    }
+                    // On failure, retry on the next 5 s tick (don't set _isIdle)
                 }
             }
             else
@@ -59,14 +65,23 @@ public class IdleMonitor
                 if (_isIdle)
                 {
                     FileLogger.LogInfo("User active again.");
-                    _isIdle = false;
-                    PostIdleState("active", 0);
+                    // Only set _isIdle after a successful POST
+                    if (PostIdleState("active", 0))
+                    {
+                        _isIdle = false;
+                        // After successful POST of "active", force-report the current window
+                        _windowTracker.ForceReport();
+                    }
+                    // On failure, retry on the next 5 s tick (remain _isIdle = true)
                 }
             }
         }
     }
 
-    private void PostIdleState(string idleState, double idleSeconds)
+    /// <summary>
+    /// Posts the idle state to the service. Returns true on success, false on failure.
+    /// </summary>
+    private bool PostIdleState(string idleState, double idleSeconds)
     {
         try
         {
@@ -74,11 +89,13 @@ public class IdleMonitor
             var content = new StringContent(json, Encoding.UTF8, "application/json");
             var response = _httpClient.PostAsync(_serviceUrl, content).GetAwaiter().GetResult();
             FileLogger.LogInfo($"POST /idle ({idleState}) -> {(int)response.StatusCode}");
+            return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
         {
             // Service may not be running yet — silently retry on next cycle
             FileLogger.LogWarn($"POST /idle failed: {ex.Message}");
+            return false;
         }
     }
 

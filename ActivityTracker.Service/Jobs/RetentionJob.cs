@@ -64,11 +64,11 @@ public class RetentionJob : BackgroundService
                     strftime('%Y-%m', start_time, 'unixepoch') as month,
                     type as category,
                     process_or_domain as key,
-                    browser,
+                    COALESCE(browser, '') as browser,
                     SUM(COALESCE(end_time, @now) - start_time) as total_seconds
                 FROM events
                 WHERE start_time < @cutoff AND end_time IS NOT NULL
-                GROUP BY month, category, key, browser
+                GROUP BY month, category, key, COALESCE(browser, '')
                 ON CONFLICT(month, category, key, browser) DO UPDATE SET
                     total_seconds = total_seconds + excluded.total_seconds;
             ";

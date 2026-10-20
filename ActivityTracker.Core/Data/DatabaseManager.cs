@@ -78,12 +78,68 @@ public class DatabaseManager
                 month TEXT NOT NULL,
                 category TEXT NOT NULL,
                 key TEXT NOT NULL,
-                browser TEXT,
+                browser TEXT NOT NULL DEFAULT '',
                 total_seconds INTEGER NOT NULL,
                 PRIMARY KEY (month, category, key, browser)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_time);
+            CREATE INDEX IF NOT EXISTS idx_events_type_key ON events(type, process_or_domain);
         ";
         command.ExecuteNonQuery();
+
+        // Migrate existing NULLs to '' in monthly_summary
+        try
+        {
+            using var pragmaCmd = connection.CreateCommand();
+            pragmaCmd.CommandText = "PRAGMA table_info(monthly_summary);";
+            using var reader = pragmaCmd.ExecuteReader();
+            bool needsMigration = false;
+            while (reader.Read())
+            {
+                var colName = reader.GetString(1);
+                var notNull = reader.GetInt32(3);
+                if (string.Equals(colName, "browser", StringComparison.OrdinalIgnoreCase) && notNull == 0)
+                {
+                    needsMigration = true;
+                    break;
+                }
+            }
+            reader.Close();
+
+            if (needsMigration)
+            {
+                using var migCmd = connection.CreateCommand();
+                migCmd.CommandText = @"
+                    CREATE TABLE _monthly_summary_new (
+                        month TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        browser TEXT NOT NULL DEFAULT '',
+                        total_seconds INTEGER NOT NULL,
+                        PRIMARY KEY (month, category, key, browser)
+                    );
+                    INSERT OR IGNORE INTO _monthly_summary_new (month, category, key, browser, total_seconds)
+                    SELECT month, category, key, COALESCE(browser, ''), SUM(total_seconds)
+                    FROM monthly_summary
+                    GROUP BY month, category, key, COALESCE(browser, '');
+
+                    DROP TABLE monthly_summary;
+                    ALTER TABLE _monthly_summary_new RENAME TO monthly_summary;
+                ";
+                migCmd.ExecuteNonQuery();
+            }
+            else
+            {
+                using var updateCmd = connection.CreateCommand();
+                updateCmd.CommandText = "UPDATE monthly_summary SET browser = '' WHERE browser IS NULL;";
+                updateCmd.ExecuteNonQuery();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Failed to migrate monthly_summary schema.");
+        }
     }
 
     public long InsertEvent(EventRecord record)
@@ -126,21 +182,16 @@ public class DatabaseManager
 
         if (endTime < startTime)
         {
-            // Negative duration — discard the row rather than corrupt report data.
-            // The warning is deliberately noisy so regressions surface in logs.
+            // Negative duration — CLAMP end = start and log a warning (do not delete).
             _logger?.LogWarning(
-                "Negative-duration event discarded: id={EventId}, process={Process}, start_time={StartTime}, end_time={EndTime}",
+                "Negative-duration event clamped: id={EventId}, process={Process}, start_time={StartTime}, end_time={EndTime} → clamped to start_time",
                 id, processOrDomain, startTime, endTime);
-
-            using var delCmd = connection.CreateCommand();
-            delCmd.CommandText = "DELETE FROM events WHERE id = @id;";
-            delCmd.Parameters.AddWithValue("@id", id);
-            delCmd.ExecuteNonQuery();
-            return;
+            endTime = startTime;
         }
 
         using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE events SET end_time = @end_time WHERE id = @id;";
+        // Only update rows whose end_time is still NULL so closed rows are never overwritten.
+        command.CommandText = "UPDATE events SET end_time = @end_time WHERE id = @id AND end_time IS NULL;";
         command.Parameters.AddWithValue("@end_time", endTime);
         command.Parameters.AddWithValue("@id", id);
         command.ExecuteNonQuery();

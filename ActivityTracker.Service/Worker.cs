@@ -27,7 +27,10 @@ public class Worker : BackgroundService
     {
         _logger.LogInformation("Activity Tracker Service starting.");
 
-        // Fix orphaned rows left open by a previous crash (count as 0 duration).
+        // Ensure the meta table exists
+        EnsureMetaTable();
+
+        // Fix orphaned rows left open by a previous crash.
         FixOrphanedEvents();
 
         _windowSessionManager = new WindowSessionManager(_logger, _dbManager);
@@ -46,7 +49,9 @@ public class Worker : BackgroundService
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                await Task.Delay(1000, stoppingToken);
+                // Write last_seen heartbeat every 30 s
+                WriteLastSeen();
+                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
             }
         }
         catch (TaskCanceledException)
@@ -58,7 +63,42 @@ public class Worker : BackgroundService
             _systemStateTracker.Stop();
             _httpListener.Stop();
 
+            // Close everything before stopping
+            _httpListener.CloseEverything(DateTimeOffset.UtcNow);
+
             _logger.LogInformation("Activity Tracker Service stopped.");
+        }
+    }
+
+    private void EnsureMetaTable()
+    {
+        try
+        {
+            using var conn = _dbManager.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);";
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create meta table.");
+        }
+    }
+
+    private void WriteLastSeen()
+    {
+        try
+        {
+            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var conn = _dbManager.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO meta (key, value) VALUES ('last_seen', @v) ON CONFLICT(key) DO UPDATE SET value = @v;";
+            cmd.Parameters.AddWithValue("@v", nowUnix);
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to write last_seen.");
         }
     }
 
@@ -66,14 +106,45 @@ public class Worker : BackgroundService
     {
         try
         {
-            using var conn = _dbManager.GetConnection();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = "UPDATE events SET end_time = start_time WHERE end_time IS NULL;";
-            var affected = cmd.ExecuteNonQuery();
-            if (affected > 0)
-                _logger.LogWarning("Fixed {Count} orphaned event(s) with NULL end_time (set to start_time, counts as 0s).", affected);
-            else
-                _logger.LogInformation("No orphaned events found.");
+            var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            // Read last_seen from meta table (if it exists)
+            long? lastSeen = null;
+            using (var conn = _dbManager.GetConnection())
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT value FROM meta WHERE key = 'last_seen';";
+                var result = cmd.ExecuteScalar();
+                if (result != null && result != DBNull.Value)
+                {
+                    lastSeen = Convert.ToInt64(result);
+                }
+            }
+
+            using (var conn = _dbManager.GetConnection())
+            {
+                using var cmd = conn.CreateCommand();
+                if (lastSeen.HasValue)
+                {
+                    // end_time = MAX(start_time, MIN(last_seen, now))
+                    var cappedLastSeen = Math.Min(lastSeen.Value, nowUnix);
+                    cmd.CommandText = @"
+                        UPDATE events SET end_time = MAX(start_time, @capped_last_seen) 
+                        WHERE end_time IS NULL;";
+                    cmd.Parameters.AddWithValue("@capped_last_seen", cappedLastSeen);
+                }
+                else
+                {
+                    // No last_seen — fall back to start_time
+                    cmd.CommandText = "UPDATE events SET end_time = start_time WHERE end_time IS NULL;";
+                }
+
+                var affected = cmd.ExecuteNonQuery();
+                if (affected > 0)
+                    _logger.LogWarning("Fixed {Count} orphaned event(s) with NULL end_time.", affected);
+                else
+                    _logger.LogInformation("No orphaned events found.");
+            }
         }
         catch (Exception ex)
         {

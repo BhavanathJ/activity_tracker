@@ -25,6 +25,9 @@ public class ExtensionListener
     // Key: browser identifier
     private readonly System.Collections.Generic.Dictionary<string, long> _currentBrowserSessions = new();
 
+    // Store the domain currently open for each browser session (for dedup)
+    private readonly System.Collections.Generic.Dictionary<string, string> _currentBrowserDomains = new();
+
     // Store ongoing audio sessions
     // Key: (browser, domain)
     private readonly System.Collections.Generic.Dictionary<(string, string), long> _currentAudioSessions = new();
@@ -34,6 +37,27 @@ public class ExtensionListener
     // Tracks the last time /audio-sync was received per browser (unix seconds).
     // Used to expire audio sessions whose browser has gone silent.
     private readonly System.Collections.Generic.Dictionary<string, long> _lastAudioSyncUnix = new();
+
+    // Idle state from SessionAgent input-idle reports
+    private bool _inputIdle;
+    private bool _mediaActive;
+    private bool _effectiveIdle;
+    private long _lastMediaHeartbeatUnix;
+    private DateTimeOffset _lastInputIdleBackdate = DateTimeOffset.UtcNow;
+
+    // Last browser event per browser, stored when the browser's process is not foreground
+    private readonly System.Collections.Generic.Dictionary<string, (string Domain, string Title, DateTimeOffset Timestamp)> _lastBrowserEvent = new(StringComparer.OrdinalIgnoreCase);
+
+    // Lock row tracking
+    private long? _lockSessionId;
+
+    // Browser-to-process map (case-insensitive)
+    private static readonly System.Collections.Generic.Dictionary<string, string[]> BrowserProcessMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        { "brave", new[] { "brave" } },
+        { "chrome", new[] { "chrome" } },
+        { "edge", new[] { "msedge" } }
+    };
 
     public ExtensionListener(ILogger logger, DatabaseManager dbManager, WindowSessionManager windowSessionManager)
     {
@@ -45,20 +69,53 @@ public class ExtensionListener
 
     public void Start()
     {
-        _logger.LogInformation($"Starting HTTP Listener on port {_config.HttpPort}...");
-        _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://127.0.0.1:{_config.HttpPort}/");
+        _cts = new CancellationTokenSource();
+        _lastMediaHeartbeatUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        _ = Task.Run(() => StartWithRetryAsync(_cts.Token));
+    }
 
-        try
+    private async Task StartWithRetryAsync(CancellationToken token)
+    {
+        var startTime = DateTimeOffset.UtcNow;
+        var maxDuration = TimeSpan.FromMinutes(5);
+
+        while (!token.IsCancellationRequested)
         {
-            _listener.Start();
-            _cts = new CancellationTokenSource();
-            _ = Task.Run(() => ListenAsync(_cts.Token));
-            _ = Task.Run(() => ExpireStaleAudioSessionsLoopAsync(_cts.Token));
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to start HTTP Listener");
+            try
+            {
+                _logger.LogInformation($"Starting HTTP Listener on port {_config.HttpPort}...");
+                _listener = new HttpListener();
+                _listener.Prefixes.Add($"http://127.0.0.1:{_config.HttpPort}/");
+                _listener.Start();
+
+                _logger.LogInformation("HTTP Listener started successfully on port {Port}.", _config.HttpPort);
+                _ = Task.Run(() => ListenAsync(token), token);
+                _ = Task.Run(() => ExpireStaleAudioSessionsLoopAsync(token), token);
+                _ = Task.Run(() => ExpireMediaLoopAsync(token), token);
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to start HTTP Listener on port {Port}. Retrying in 5 seconds...", _config.HttpPort);
+                try { _listener?.Close(); } catch { }
+                _listener = null;
+
+                if (DateTimeOffset.UtcNow - startTime >= maxDuration)
+                {
+                    _logger.LogCritical("HTTP Listener failed to start after 5 minutes of retries. Exiting process with code 1 for SCM recovery.");
+                    Environment.Exit(1);
+                    return;
+                }
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
         }
     }
 
@@ -88,6 +145,7 @@ public class ExtensionListener
                 _dbManager.UpdateEventEndTime(sessionId, endUnix);
             }
             _currentBrowserSessions.Clear();
+            _currentBrowserDomains.Clear();
         }
     }
 
@@ -115,6 +173,35 @@ public class ExtensionListener
     {
         CloseAllBrowserSessions(endTime);
         CloseAllAudioSessions(endTime);
+    }
+
+    /// <summary>
+    /// Closes the window session, all browser sessions, all audio sessions,
+    /// and the open lock row. Called on service shutdown.
+    /// </summary>
+    public void CloseEverything(DateTimeOffset now)
+    {
+        _windowSessionManager.CloseCurrentSession(now);
+        CloseAllBrowserAndAudioSessions(now);
+
+        // Close open lock row
+        lock (_sessionLock)
+        {
+            if (_lockSessionId.HasValue)
+            {
+                _dbManager.UpdateEventEndTime(_lockSessionId.Value, now.ToUnixTimeSeconds());
+                _lockSessionId = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the lock session id. Used by SystemStateTracker.
+    /// </summary>
+    public long? LockSessionId
+    {
+        get { lock (_sessionLock) { return _lockSessionId; } }
+        set { lock (_sessionLock) { _lockSessionId = value; } }
     }
 
     /// <summary>
@@ -169,11 +256,11 @@ public class ExtensionListener
 
     private async Task ListenAsync(CancellationToken token)
     {
-        while (!token.IsCancellationRequested)
+        while (!token.IsCancellationRequested && _listener != null && _listener.IsListening)
         {
             try
             {
-                var context = await _listener!.GetContextAsync().WaitAsync(token);
+                var context = await _listener.GetContextAsync().WaitAsync(token);
                 _ = Task.Run(() => HandleRequestAsync(context), token);
             }
             catch (OperationCanceledException)
@@ -188,12 +275,49 @@ public class ExtensionListener
         }
     }
 
+    private static async Task<(string? Body, bool TooLarge)> ReadBodyWithLimitAsync(HttpListenerRequest request, int maxBytes)
+    {
+        if (request.ContentLength64 > maxBytes)
+        {
+            return (null, true);
+        }
+
+        using var ms = new MemoryStream();
+        var buffer = new byte[8192];
+        int totalRead = 0;
+        int read;
+
+        while ((read = await request.InputStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+        {
+            totalRead += read;
+            if (totalRead > maxBytes)
+            {
+                return (null, true);
+            }
+            ms.Write(buffer, 0, read);
+        }
+
+        var text = System.Text.Encoding.UTF8.GetString(ms.ToArray());
+        return (text, false);
+    }
+
     private async Task HandleRequestAsync(HttpListenerContext context)
     {
         try
         {
-            // Simple CORS
-            context.Response.AppendHeader("Access-Control-Allow-Origin", "*");
+            // 1. Origin header check (HTTP hardening)
+            var origin = context.Request.Headers["Origin"];
+            if (!string.IsNullOrEmpty(origin))
+            {
+                if (!origin.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("Forbidden request with unauthorized Origin: {Origin}", origin);
+                    context.Response.StatusCode = 403;
+                    return;
+                }
+                context.Response.AppendHeader("Access-Control-Allow-Origin", origin);
+            }
+
             context.Response.AppendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             context.Response.AppendHeader("Access-Control-Allow-Headers", "Content-Type");
 
@@ -212,11 +336,22 @@ public class ExtensionListener
                 return;
             }
 
+            // 2. Cap request body at 64 KB (65536 bytes) for all POST requests
+            string body = "";
+            if (context.Request.HttpMethod == "POST")
+            {
+                var (b, tooLarge) = await ReadBodyWithLimitAsync(context.Request, 65536);
+                if (tooLarge)
+                {
+                    _logger.LogWarning("Request body exceeded 64 KB limit on {Path}. Replying 413.", context.Request.Url?.AbsolutePath);
+                    context.Response.StatusCode = 413;
+                    return;
+                }
+                body = b ?? "";
+            }
+
             if (context.Request.Url!.AbsolutePath == "/event" && context.Request.HttpMethod == "POST")
             {
-                using var reader = new StreamReader(context.Request.InputStream);
-                var body = await reader.ReadToEndAsync();
-
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.ExtensionEventPayload);
                 if (payload != null)
                 {
@@ -229,9 +364,6 @@ public class ExtensionListener
 
             if (context.Request.Url!.AbsolutePath == "/idle" && context.Request.HttpMethod == "POST")
             {
-                using var reader = new StreamReader(context.Request.InputStream);
-                var body = await reader.ReadToEndAsync();
-
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.IdleEventPayload);
                 if (payload != null)
                 {
@@ -242,11 +374,21 @@ public class ExtensionListener
                 return;
             }
 
+            if (context.Request.Url!.AbsolutePath == "/media" && context.Request.HttpMethod == "POST")
+            {
+                var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.MediaEventPayload);
+                if (payload != null)
+                {
+                    HandleMediaEvent(payload);
+                }
+
+                context.Response.StatusCode = 200;
+                return;
+            }
+
             // Endpoint to blur a specific browser (close its active session)
             if (context.Request.Url!.AbsolutePath == "/blur" && context.Request.HttpMethod == "POST")
             {
-                using var reader = new StreamReader(context.Request.InputStream);
-                var body = await reader.ReadToEndAsync();
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.BlurEventPayload);
                 if (payload != null && !string.IsNullOrEmpty(payload.Browser))
                 {
@@ -257,6 +399,7 @@ public class ExtensionListener
                         {
                             _dbManager.UpdateEventEndTime(sessId, nowUnix);
                             _currentBrowserSessions.Remove(payload.Browser);
+                            _currentBrowserDomains.Remove(payload.Browser);
                         }
                     }
                 }
@@ -266,13 +409,11 @@ public class ExtensionListener
 
             if (context.Request.Url!.AbsolutePath == "/window" && context.Request.HttpMethod == "POST")
             {
-                using var reader = new StreamReader(context.Request.InputStream);
-                var body = await reader.ReadToEndAsync();
-
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.WindowEventPayload);
                 if (payload != null)
                 {
                     _windowSessionManager.HandleWindowChange(payload.ProcessOrDomain, payload.Title);
+                    HandleWindowProcessChange(payload.ProcessOrDomain);
                 }
 
                 context.Response.StatusCode = 200;
@@ -281,9 +422,6 @@ public class ExtensionListener
 
             if (context.Request.Url!.AbsolutePath == "/audio-sync" && context.Request.HttpMethod == "POST")
             {
-                using var reader = new StreamReader(context.Request.InputStream);
-                var body = await reader.ReadToEndAsync();
-
                 var payload = JsonSerializer.Deserialize(body, ServiceJsonContext.Default.AudioSyncPayload);
                 if (payload != null && !string.IsNullOrEmpty(payload.Browser))
                 {
@@ -307,6 +445,54 @@ public class ExtensionListener
         }
     }
 
+    /// <summary>
+    /// When /window reports a process change, check if it belongs to a browser
+    /// and replay stored browser events, or close browser sessions if it's not a browser.
+    /// </summary>
+    private void HandleWindowProcessChange(string processName)
+    {
+        var normalizedProcess = processName.ToLowerInvariant();
+        string? matchedBrowser = null;
+
+        foreach (var kv in BrowserProcessMap)
+        {
+            foreach (var proc in kv.Value)
+            {
+                if (string.Equals(proc, normalizedProcess, StringComparison.OrdinalIgnoreCase))
+                {
+                    matchedBrowser = kv.Key;
+                    break;
+                }
+            }
+            if (matchedBrowser != null) break;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+
+        if (matchedBrowser != null)
+        {
+            // Process belongs to a browser — check if we have a stored event for it
+            lock (_sessionLock)
+            {
+                if (!_currentBrowserSessions.ContainsKey(matchedBrowser) &&
+                    _lastBrowserEvent.TryGetValue(matchedBrowser, out var stored))
+                {
+                    // Only replay if the stored event is less than 5 seconds old
+                    if ((now - stored.Timestamp).TotalSeconds < 5)
+                    {
+                        _lastBrowserEvent.Remove(matchedBrowser);
+                        OpenBrowserSessionLocked(matchedBrowser, stored.Domain, stored.Title, now.ToUnixTimeSeconds());
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Not a browser process — close all browser sessions
+            CloseAllBrowserSessions(now);
+        }
+    }
+
     private void HandleBrowserEvent(ExtensionEventPayload payload)
     {
         if (string.IsNullOrEmpty(payload.Browser) || string.IsNullOrEmpty(payload.Url)) return;
@@ -326,6 +512,7 @@ public class ExtensionListener
                     {
                         _dbManager.UpdateEventEndTime(prevId, now);
                         _currentBrowserSessions.Remove(payload.Browser);
+                        _currentBrowserDomains.Remove(payload.Browser);
                     }
                 }
             }
@@ -334,24 +521,32 @@ public class ExtensionListener
 
         lock (_sessionLock)
         {
-            // Focus event: close the previous session for this browser and open a new one.
+            // Focus event: open a browser session ONLY if the current foreground process
+            // belongs to this browser. Otherwise store the event for replay.
             if (!payload.IsAudioOnly)
             {
+                var currentProcess = _windowSessionManager.CurrentProcess;
+                if (!IsProcessForBrowser(payload.Browser, currentProcess))
+                {
+                    // Store for replay when the browser's process becomes foreground
+                    _lastBrowserEvent[payload.Browser] = (domain, payload.Title ?? "", DateTimeOffset.UtcNow);
+                    return;
+                }
+
+                // Dedupe: if domain equals the currently open session, do nothing
+                if (_currentBrowserDomains.TryGetValue(payload.Browser, out var currentDomain) &&
+                    string.Equals(currentDomain, domain, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                // Close previous session for this browser
                 if (_currentBrowserSessions.TryGetValue(payload.Browser, out var prevSessionId))
                 {
                     _dbManager.UpdateEventEndTime(prevSessionId, now);
                 }
 
-                var record = new EventRecord
-                {
-                    Type = "browser",
-                    ProcessOrDomain = domain,
-                    Browser = payload.Browser,
-                    Title = payload.Title ?? "",
-                    StartTime = now
-                };
-
-                _currentBrowserSessions[payload.Browser] = _dbManager.InsertEvent(record);
+                OpenBrowserSessionLocked(payload.Browser, domain, payload.Title ?? "", now);
             }
 
             // Audio event (active tab or background tab).
@@ -393,17 +588,110 @@ public class ExtensionListener
         if (payload.State == "idle")
         {
             _logger.LogInformation($"SessionAgent reports idle ({payload.IdleSeconds:F0}s).");
-            // Backdate the session end to when input actually stopped.
-            // Audio sessions (podcasts, YouTube) are intentionally left open while idle.
-            var endTime = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
-            _windowSessionManager.CloseCurrentSession(endTime);
-            CloseAllBrowserSessions(endTime);
+            lock (_sessionLock)
+            {
+                _inputIdle = true;
+                _lastInputIdleBackdate = DateTimeOffset.UtcNow.AddSeconds(-payload.IdleSeconds);
+                ApplyEffectiveIdle(fromMediaChange: false, backdatedTime: _lastInputIdleBackdate);
+            }
         }
         else if (payload.State == "active")
         {
             _logger.LogInformation("SessionAgent reports user active.");
-            // Do not reopen browser sessions here; the extension re-sends the active tab.
-            _windowSessionManager.ForceReevaluate();
+            lock (_sessionLock)
+            {
+                _inputIdle = false;
+                ApplyEffectiveIdle(fromMediaChange: false);
+            }
+        }
+    }
+
+    private void HandleMediaEvent(MediaEventPayload payload)
+    {
+        lock (_sessionLock)
+        {
+            _lastMediaHeartbeatUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            bool newMediaActive = payload.Playing;
+
+            if (_mediaActive != newMediaActive)
+            {
+                _logger.LogInformation("Media state changed: _mediaActive={Playing} (Source={Source}, Process={Process})",
+                    newMediaActive, payload.Source, payload.Process);
+                _mediaActive = newMediaActive;
+                ApplyEffectiveIdle(fromMediaChange: true);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Applies the effective idle state: effectiveIdle = _inputIdle && !_mediaActive.
+    /// When effectiveIdle turns true:
+    /// - If triggered by input idle (no media): close backdated to last input time.
+    /// - If triggered by media stopping while input is already idle: close NOW (time media stopped).
+    /// When effectiveIdle turns false (either user active or media started):
+    /// - Treat as active (SetIdle(false)) and reopen from the remembered window.
+    /// Must be called under _sessionLock.
+    /// </summary>
+    private void ApplyEffectiveIdle(bool fromMediaChange, DateTimeOffset? backdatedTime = null)
+    {
+        bool newEffectiveIdle = _inputIdle && !_mediaActive;
+
+        if (!_effectiveIdle && newEffectiveIdle)
+        {
+            _effectiveIdle = true;
+            _windowSessionManager.SetIdle(true);
+
+            DateTimeOffset closeTime;
+            if (fromMediaChange)
+            {
+                // _mediaActive turned false while _inputIdle was true: close NOW
+                closeTime = DateTimeOffset.UtcNow;
+                _logger.LogInformation("Media stopped while input idle. Closing sessions NOW ({Time}).", closeTime.ToString("o"));
+            }
+            else
+            {
+                // Input idle with no media: close backdated to last input time
+                closeTime = backdatedTime ?? _lastInputIdleBackdate;
+                _logger.LogInformation("Entering effective idle. Closing sessions backdated to {Time}.", closeTime.ToString("o"));
+            }
+
+            _windowSessionManager.CloseCurrentSession(closeTime);
+            CloseAllBrowserSessions(closeTime);
+        }
+        else if (_effectiveIdle && !newEffectiveIdle)
+        {
+            _effectiveIdle = false;
+            _logger.LogInformation("Leaving effective idle (_inputIdle={InputIdle}, _mediaActive={MediaActive}). Treating as active.",
+                _inputIdle, _mediaActive);
+
+            _windowSessionManager.SetIdle(false);
+            _windowSessionManager.ReopenRememberedWindow();
+        }
+    }
+
+    /// <summary>
+    /// Auto-expires _mediaActive if no /media heartbeat has arrived for 90 s.
+    /// </summary>
+    private async Task ExpireMediaLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(5), token); }
+            catch (OperationCanceledException) { break; }
+
+            lock (_sessionLock)
+            {
+                if (_mediaActive)
+                {
+                    var elapsed = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - _lastMediaHeartbeatUnix;
+                    if (elapsed >= 90)
+                    {
+                        _logger.LogWarning("No /media heartbeat received in {Elapsed}s (threshold 90s) — expiring _mediaActive to false.", elapsed);
+                        _mediaActive = false;
+                        ApplyEffectiveIdle(fromMediaChange: true);
+                    }
+                }
+            }
         }
     }
 
@@ -454,6 +742,40 @@ public class ExtensionListener
                 // Existing session: leave it open (do not close/reopen).
             }
         }
+    }
+
+    /// <summary>
+    /// Opens a browser session and records the domain for dedup. Must be called under _sessionLock.
+    /// </summary>
+    private void OpenBrowserSessionLocked(string browser, string domain, string title, long nowUnix)
+    {
+        var record = new EventRecord
+        {
+            Type = "browser",
+            ProcessOrDomain = domain,
+            Browser = browser,
+            Title = title,
+            StartTime = nowUnix
+        };
+
+        _currentBrowserSessions[browser] = _dbManager.InsertEvent(record);
+        _currentBrowserDomains[browser] = domain;
+    }
+
+    /// <summary>
+    /// Returns true if the given processName (case-insensitive) is in the process list
+    /// for the given browser in BrowserProcessMap.
+    /// </summary>
+    private static bool IsProcessForBrowser(string browser, string? processName)
+    {
+        if (string.IsNullOrEmpty(processName)) return false;
+        if (!BrowserProcessMap.TryGetValue(browser, out var processes)) return false;
+        foreach (var p in processes)
+        {
+            if (string.Equals(p, processName, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private string GetDomainFromUrl(string urlStr)

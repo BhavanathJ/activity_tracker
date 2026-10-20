@@ -2,10 +2,7 @@ import { BROWSER_ID, CONFIG_URL, EVENT_URL } from './config.js';
 
 const BLUR_URL = EVENT_URL.replace('/event', '/blur');
 const AUDIO_SYNC_URL = EVENT_URL.replace('/event', '/audio-sync');
-
-let includeDomains = [];
-let excludeDomains = [];
-let activeTabId = null;
+const MEDIA_URL = EVENT_URL.replace('/event', '/media');
 
 // ---------- Focus guard ----------
 
@@ -18,23 +15,50 @@ async function isBrowserFocused() {
   }
 }
 
-// ---------- Config ----------
+// ---------- Idle Interval Setup ----------
 
-async function fetchConfig() {
+async function setupIdleInterval() {
+  let timeout = 180;
   try {
-    const res = await fetch(CONFIG_URL);
-    if (res.ok) {
-      const config = await res.json();
-      includeDomains = config.IncludeDomains || [];
-      excludeDomains = config.ExcludeDomains || [];
+    if (chrome.storage && chrome.storage.session) {
+      const data = await chrome.storage.session.get('idleTimeoutSeconds');
+      if (data && typeof data.idleTimeoutSeconds === 'number' && data.idleTimeoutSeconds > 0) {
+        timeout = data.idleTimeoutSeconds;
+      } else {
+        try {
+          const res = await fetch(CONFIG_URL);
+          if (res.ok) {
+            const config = await res.json();
+            if (config && typeof config.IdleTimeoutSeconds === 'number' && config.IdleTimeoutSeconds > 0) {
+              timeout = config.IdleTimeoutSeconds;
+            }
+          }
+        } catch (_) {}
+        await chrome.storage.session.set({ idleTimeoutSeconds: timeout });
+      }
+    } else {
+      try {
+        const res = await fetch(CONFIG_URL);
+        if (res.ok) {
+          const config = await res.json();
+          if (config && typeof config.IdleTimeoutSeconds === 'number' && config.IdleTimeoutSeconds > 0) {
+            timeout = config.IdleTimeoutSeconds;
+          }
+        }
+      } catch (_) {}
     }
-  } catch (err) {
-    console.error('Failed to fetch tracker config', err);
+  } catch (_) {
+    timeout = 180;
+  }
+
+  try {
+    chrome.idle.setDetectionInterval(timeout);
+  } catch (_) {
+    try {
+      chrome.idle.setDetectionInterval(180);
+    } catch (_) {}
   }
 }
-
-fetchConfig();
-setInterval(fetchConfig, 5 * 60 * 1000);
 
 // ---------- HTTP helpers ----------
 
@@ -68,7 +92,6 @@ async function sendBlur() {
 }
 
 // Query all currently audible tabs, map to hostnames, and POST /audio-sync.
-// The service will close stale sessions and open new ones as needed.
 async function sendAudioSync() {
   try {
     const tabs = await chrome.tabs.query({ audible: true });
@@ -87,49 +110,79 @@ async function sendAudioSync() {
   } catch (_) {}
 }
 
+// Query the active tab of the focused window; Playing = tab.audible === true.
+// POST /media { Source: "extension", Playing: bool, Process: BROWSER_ID }
+async function sendMedia() {
+  try {
+    let playing = false;
+    if (await isBrowserFocused()) {
+      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (tab && tab.audible === true) {
+        playing = true;
+      }
+    }
+
+    await fetch(MEDIA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        Source: 'extension',
+        Playing: playing,
+        Process: BROWSER_ID
+      })
+    });
+  } catch (_) {}
+}
+
 // ---------- Active-tab helpers ----------
 
 async function sendActiveTab() {
-  if (!(await isBrowserFocused())) return;
+  if (!(await isBrowserFocused())) {
+    await sendBlur();
+    return;
+  }
   try {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (tab && tab.url && tab.url.startsWith('http')) {
-      activeTabId = tab.id;
       await sendEvent(tab.url, tab.title, tab.audible);
+    } else {
+      await sendBlur();
     }
-  } catch (_) {}
+  } catch (_) {
+    await sendBlur();
+  }
 }
 
 async function sendActiveTabOfWindow(windowId) {
-  if (!(await isBrowserFocused())) return;
+  if (!(await isBrowserFocused())) {
+    await sendBlur();
+    return;
+  }
   try {
     const [tab] = await chrome.tabs.query({ active: true, windowId });
     if (tab && tab.url && tab.url.startsWith('http')) {
-      activeTabId = tab.id;
       await sendEvent(tab.url, tab.title, tab.audible);
+    } else {
+      await sendBlur();
     }
-  } catch (_) {}
+  } catch (_) {
+    await sendBlur();
+  }
 }
 
-// ---------- Service-worker startup ----------
-// Sync current audible state so the service starts clean after a SW restart.
-(async () => {
-  await sendAudioSync();
-})();
+// ---------- 30 s Alarm ----------
 
-// ---------- Audio heartbeat (every 30 s) ----------
-// chrome.alarms keeps the service worker alive and provides a reliable 30 s tick
-// so the service can detect dead browsers via the 90 s stale threshold.
 const AUDIO_HEARTBEAT_ALARM = 'audio-heartbeat';
 chrome.alarms.create(AUDIO_HEARTBEAT_ALARM, { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === AUDIO_HEARTBEAT_ALARM) {
-    sendAudioSync();
+    await sendAudioSync();
+    if (await isBrowserFocused()) {
+      await sendActiveTab();
+    }
+    await sendMedia();
   }
 });
-
-// Set idle detection interval to 60 seconds.
-chrome.idle.setDetectionInterval(60);
 
 // ---------- Idle / lock detection ----------
 
@@ -139,6 +192,7 @@ chrome.idle.onStateChanged.addListener(async (state) => {
   } else if (state === 'active') {
     await sendActiveTab();
   }
+  await sendMedia();
 });
 
 // ---------- Window focus changes ----------
@@ -149,47 +203,71 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
   } else {
     await sendActiveTabOfWindow(windowId);
   }
+  await sendMedia();
 });
 
 // ---------- Tab activation ----------
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  activeTabId = activeInfo.tabId;
-  if (!(await isBrowserFocused())) return;
+  if (!(await isBrowserFocused())) {
+    await sendBlur();
+    await sendMedia();
+    return;
+  }
   try {
-    const tab = await chrome.tabs.get(activeTabId);
+    const tab = await chrome.tabs.get(activeInfo.tabId);
     if (tab && tab.url && tab.url.startsWith('http')) {
       await sendEvent(tab.url, tab.title, tab.audible);
+    } else {
+      await sendBlur();
     }
-  } catch (_) {}
+  } catch (_) {
+    await sendBlur();
+  }
+  await sendMedia();
 });
 
 // ---------- Tab updates (URL/title/audible changes) ----------
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (!tab.url || !tab.url.startsWith('http')) return;
+  // Call sendAudioSync() whenever changeInfo.audible !== undefined, independent of the title/url branch
+  if (changeInfo.audible !== undefined) {
+    await sendAudioSync();
+    await sendMedia();
+  }
 
-  if (tabId === activeTabId) {
-    // Active tab: report focus events AND audible changes.
-    if (changeInfo.url || changeInfo.title) {
-      if (!(await isBrowserFocused())) return;
-      await sendEvent(tab.url, tab.title, tab.audible);
-    } else if (changeInfo.audible !== undefined) {
-      // Active tab toggled audio: sync the full audible set.
-      await sendAudioSync();
-    }
-  } else {
-    // Background tab: only care about audible changes.
-    if (changeInfo.audible !== undefined) {
-      await sendAudioSync();
-    }
+  // Stateless "active and focused" check for URL or title change
+  if (changeInfo.url || changeInfo.title) {
+    try {
+      if (tab.active === true) {
+        const lastFocused = await chrome.windows.getLastFocused();
+        if (lastFocused && lastFocused.focused === true && lastFocused.id === tab.windowId) {
+          if (tab.url && tab.url.startsWith('http')) {
+            await sendEvent(tab.url, tab.title, tab.audible);
+          } else {
+            await sendBlur();
+          }
+          await sendMedia();
+        }
+      }
+    } catch (_) {}
   }
 });
 
 // ---------- Tab removal ----------
-// Re-sync the audible set; the removed tab won't appear in the query,
-// so the service will close its session automatically if it was audible.
 
 chrome.tabs.onRemoved.addListener(async () => {
   await sendAudioSync();
+  await sendMedia();
 });
+
+// ---------- Service-worker startup ----------
+
+(async () => {
+  await setupIdleInterval();
+  await sendAudioSync();
+  if (await isBrowserFocused()) {
+    await sendActiveTab();
+  }
+  await sendMedia();
+})();

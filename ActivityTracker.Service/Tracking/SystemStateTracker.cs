@@ -13,11 +13,11 @@ public class SystemStateTracker
     private readonly WindowSessionManager _windowSessionManager;
     private readonly DatabaseManager _dbManager;
     private readonly ExtensionListener _extensionListener;
-    private long? _lockSessionId;
     private const int WTS_SESSION_LOCK = 0x7;
     private const int WTS_SESSION_UNLOCK = 0x8;
     private const int PBT_APMSUSPEND = 0x0004;
     private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    private const int PBT_APMRESUMESUSPEND = 0x0007;
 
     public SystemStateTracker(ILogger logger, WindowSessionManager windowSessionManager, DatabaseManager dbManager, ExtensionListener extensionListener)
     {
@@ -50,6 +50,7 @@ public class SystemStateTracker
         if (reason == WTS_SESSION_LOCK)
         {
             _logger.LogInformation("System Locked.");
+            _windowSessionManager.SetLocked(true);
             _windowSessionManager.CloseCurrentSession(now);
             // Audio sessions (podcasts, YouTube) are intentionally left running while locked.
             _extensionListener.CloseAllBrowserSessions(now);
@@ -61,16 +62,17 @@ public class SystemStateTracker
                 Title = "Locked",
                 StartTime = now.ToUnixTimeSeconds()
             };
-            _lockSessionId = _dbManager.InsertEvent(record);
+            _extensionListener.LockSessionId = _dbManager.InsertEvent(record);
         }
         else if (reason == WTS_SESSION_UNLOCK)
         {
             _logger.LogInformation("System Unlocked.");
-            if (_lockSessionId.HasValue)
+            if (_extensionListener.LockSessionId.HasValue)
             {
-                _dbManager.UpdateEventEndTime(_lockSessionId.Value, now.ToUnixTimeSeconds());
-                _lockSessionId = null;
+                _dbManager.UpdateEventEndTime(_extensionListener.LockSessionId.Value, now.ToUnixTimeSeconds());
+                _extensionListener.LockSessionId = null;
             }
+            _windowSessionManager.SetLocked(false);
             _windowSessionManager.ForceReevaluate();
         }
     }
@@ -85,7 +87,7 @@ public class SystemStateTracker
             // On suspend close everything including audio.
             _extensionListener.CloseAllBrowserAndAudioSessions(now);
         }
-        else if (eventType == PBT_APMRESUMEAUTOMATIC)
+        else if (eventType == PBT_APMRESUMEAUTOMATIC || eventType == PBT_APMRESUMESUSPEND)
         {
             _logger.LogInformation("System Resumed.");
             _windowSessionManager.ForceReevaluate();

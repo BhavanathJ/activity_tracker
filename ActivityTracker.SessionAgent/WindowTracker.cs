@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using ActivityTracker.Core.Configuration;
 
@@ -29,6 +30,24 @@ public class WindowTracker
     private string _lastReportedProcess = "";
     private string _lastReportedTitle = "";
 
+    // Channel-based single-consumer queue for ordered delivery
+    private readonly Channel<(string Process, string Title)> _sendChannel =
+        Channel.CreateBounded<(string, string)>(new BoundedChannelOptions(1)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+    private Task? _senderTask;
+    private CancellationTokenSource? _cts;
+    private Timer? _heartbeatTimer;
+
+    // Track the current foreground window for heartbeat re-reporting
+    private string _currentFgProcess = "";
+    private string _currentFgTitle = "";
+    private readonly object _fgLock = new();
+
     public WindowTracker(TrackerConfig config)
     {
         _config = config;
@@ -37,7 +56,11 @@ public class WindowTracker
     public void Start()
     {
         FileLogger.LogInfo("Starting Window Tracker in SessionAgent...");
+        _cts = new CancellationTokenSource();
         _dele = new WinEventDelegate(WinEventProc);
+
+        // Start the single-consumer sender task
+        _senderTask = Task.Run(() => SenderLoopAsync(_cts.Token));
 
         var windowReady = new ManualResetEventSlim(false);
 
@@ -86,10 +109,16 @@ public class WindowTracker
 
         // Force log the initial foreground window
         LogForegroundWindow(GetForegroundWindow());
+
+        // 30 s heartbeat: re-report the current foreground window (service dedupes)
+        _heartbeatTimer = new Timer(HeartbeatTick, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
     }
 
     public void Stop()
     {
+        _heartbeatTimer?.Dispose();
+        _cts?.Cancel();
+
         if (_hook != IntPtr.Zero)
         {
             UnhookWinEvent(_hook);
@@ -99,6 +128,9 @@ public class WindowTracker
         {
             PostMessage(_msgHwnd, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         }
+        // Complete the channel so the sender loop exits
+        _sendChannel.Writer.TryComplete();
+        _senderTask?.Wait(TimeSpan.FromSeconds(3));
         FileLogger.LogInfo("Window Tracker stopped.");
     }
 
@@ -121,6 +153,22 @@ public class WindowTracker
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 
+    private void HeartbeatTick(object? state)
+    {
+        // Re-report the current foreground window. The service dedupes identical events.
+        string process, title;
+        lock (_fgLock)
+        {
+            process = _currentFgProcess;
+            title = _currentFgTitle;
+        }
+
+        if (!string.IsNullOrEmpty(process))
+        {
+            EnqueueEvent(process, title);
+        }
+    }
+
     private void LogForegroundWindow(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return;
@@ -138,26 +186,88 @@ public class WindowTracker
         _lastReportedProcess = processName;
         _lastReportedTitle = title;
 
-        var payload = new WindowEventPayload
+        // Track current foreground for heartbeat
+        lock (_fgLock)
         {
-            ProcessOrDomain = processName,
-            Title = title
-        };
+            _currentFgProcess = processName;
+            _currentFgTitle = title;
+        }
 
-        var json = JsonSerializer.Serialize(payload, WindowEventPayloadContext.Default.WindowEventPayload);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
+        // Never log window titles in sessionagent.log — log process name only.
+        FileLogger.LogInfo($"Foreground: {processName}");
 
-        _ = Task.Run(async () =>
+        EnqueueEvent(processName, title);
+    }
+
+    private void EnqueueEvent(string processName, string title)
+    {
+        // BoundedChannel with DropOldest keeps only the latest pending event
+        _sendChannel.Writer.TryWrite((processName, title));
+    }
+
+    /// <summary>
+    /// Single-consumer loop that reads from the channel and POSTs events in order.
+    /// On failure, keeps only the latest pending event and retries with backoff (2s to 10s).
+    /// </summary>
+    private async Task SenderLoopAsync(CancellationToken token)
+    {
+        var reader = _sendChannel.Reader;
+        int backoffMs = 0;
+
+        while (await reader.WaitToReadAsync(token).ConfigureAwait(false))
         {
-            try
+            while (reader.TryRead(out var item))
             {
-                await _httpClient.PostAsync($"http://127.0.0.1:{_config.HttpPort}/window", content);
+                bool success = false;
+                while (!success && !token.IsCancellationRequested)
+                {
+                    if (backoffMs > 0)
+                    {
+                        try { await Task.Delay(backoffMs, token); }
+                        catch (OperationCanceledException) { return; }
+                    }
+
+                    // Before sending, drain any newer events (keep only the latest)
+                    while (reader.TryRead(out var newer))
+                    {
+                        item = newer;
+                    }
+
+                    success = await TrySendWindowEvent(item.Process, item.Title);
+                    if (success)
+                    {
+                        backoffMs = 0;
+                    }
+                    else
+                    {
+                        // Backoff: 2s, 4s, 6s, 8s, 10s cap
+                        backoffMs = Math.Min(backoffMs + 2000, 10000);
+                        if (backoffMs == 0) backoffMs = 2000;
+                    }
+                }
             }
-            catch (Exception ex)
+        }
+    }
+
+    private async Task<bool> TrySendWindowEvent(string processName, string title)
+    {
+        try
+        {
+            var payload = new WindowEventPayload
             {
-                FileLogger.LogError($"Failed to post window event: {ex.Message}");
-            }
-        });
+                ProcessOrDomain = processName,
+                Title = title
+            };
+            var json = JsonSerializer.Serialize(payload, WindowEventPayloadContext.Default.WindowEventPayload);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"http://127.0.0.1:{_config.HttpPort}/window", content);
+            return response.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            FileLogger.LogError($"Failed to post window event: {ex.Message}");
+            return false;
+        }
     }
 
     private static string NormalizeProcessName(string name)

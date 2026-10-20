@@ -11,11 +11,13 @@ public class Program
     {
         FileLogger.LogInfo("SessionAgent starting.");
         var config = ConfigManager.Load();
-        var monitor = new IdleMonitor(config.IdleTimeoutSeconds, config.HttpPort);
         var windowTracker = new WindowTracker(config);
+        var monitor = new IdleMonitor(config.IdleTimeoutSeconds, config.HttpPort, windowTracker);
+        var mediaMonitor = new MediaMonitor(config.HttpPort);
 
         monitor.Start();
         windowTracker.Start();
+        mediaMonitor.Start();
 
         // Subscribe to SystemEvents for lock/unlock and suspend/resume
         SystemEvents.SessionSwitch += (s, e) =>
@@ -49,6 +51,7 @@ public class Program
         };
         exitEvent.Wait();
 
+        mediaMonitor.Stop();
         windowTracker.Stop();
         monitor.Stop();
         FileLogger.LogInfo("SessionAgent stopped.");
