@@ -14,7 +14,7 @@ Because Windows isolates services in Session 0 (non-interactive), Activity Track
 ## Features
 - **Window Focus Tracking:** Monitors active application and window titles.
 - **Browser & Audio Tracking:** Tracks domain focus and background audio for Chrome, Brave, and Edge.
-- **Media-Aware Idle Detection:** User is only considered idle when there is no keyboard/mouse input AND nothing is playing media in the foreground app.
+- **Media-Aware Idle Detection:** Idle is suppressed when (a) the foreground app has a GSMTC session Playing, (b) the focused browser's active tab is audible, or (c) the foreground window is fullscreen AND audio output peak > 0.001. There is no maximum duration: media keeps the user active for as long as it plays.
 - **Encrypted Local Storage:** Zero cloud calls. Data is protected at rest with a DPAPI-encrypted SQLCipher database key.
 - **Configurable Rules:** Include or exclude specific applications or domains via a JSON configuration file.
 - **Retention & Rollups:** Automatically summarizes data older than 90 days into monthly rollups.
@@ -70,7 +70,7 @@ An automated administrative installation script is provided in the repository ro
 
 This script:
 1. Validates that Administrator privileges are present.
-2. Sets strict ACLs on `%PROGRAMDATA%\ActivityTracker` (`SYSTEM:F`, `Administrators:F`, `User:M`).
+2. Sets strict ACLs on `%PROGRAMDATA%\ActivityTracker` (`SYSTEM:F`, `Administrators:F`, `<installing user>:M`).
 3. Idempotently recreates the `ActivityTrackerService` with automatic failure restart policies (restarting after 5s/5s/60s).
 4. Registers and launches the `ActivityTrackerSessionAgent` scheduled task for the current interactive user.
 5. Verifies service status and connectivity to `http://127.0.0.1:14321/config`.

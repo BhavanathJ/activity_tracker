@@ -52,7 +52,18 @@ $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if ($existing) {
     Write-Host "Stopping existing $serviceName..."
     & sc.exe stop $serviceName | Out-Null
-    Start-Sleep -Seconds 2
+    $stopped = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        $q = & sc.exe query $serviceName
+        if ($q -match "STATE\s*:\s*\d+\s+STOPPED") {
+            $stopped = $true
+            break
+        }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $stopped) {
+        Fail-Step "StopExistingService" "$serviceName did not reach STOPPED state within 30 seconds."
+    }
     Write-Host "Deleting existing $serviceName..."
     & sc.exe delete $serviceName | Out-Null
     Start-Sleep -Seconds 2
@@ -79,10 +90,25 @@ if ($LASTEXITCODE -ne 0) {
     Fail-Step "SetFailureActions" "sc.exe failure failed."
 }
 
-# 8. Register SessionAgent scheduled task for current user
-Write-Host "Step 8: Registering SessionAgent scheduled task..."
+# Before step 8: Stop existing SessionAgent scheduled task and processes
 $taskName = "ActivityTrackerSessionAgent"
 $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    Write-Host "Stopping existing scheduled task $taskName..."
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+}
+
+Write-Host "Stopping any running ActivityTracker.SessionAgent processes..."
+Get-Process ActivityTracker.SessionAgent -EA SilentlyContinue | Stop-Process -Force
+for ($i = 0; $i -lt 10; $i++) {
+    if (-not (Get-Process ActivityTracker.SessionAgent -EA SilentlyContinue)) {
+        break
+    }
+    Start-Sleep -Seconds 1
+}
+
+# 8. Register SessionAgent scheduled task for current user
+Write-Host "Step 8: Registering SessionAgent scheduled task..."
 if ($existingTask) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
 }
