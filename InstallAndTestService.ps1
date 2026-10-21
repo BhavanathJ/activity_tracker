@@ -133,7 +133,7 @@ Start-Sleep -Seconds 3
 # 10. Verify service status and HTTP GET /config
 Write-Host "Step 10: Verifying service and HTTP endpoint..."
 $queryOutput = & sc.exe query $serviceName
-if ($queryOutput -notmatch "STATE\s*:\s*\d+\s+RUNNING") {
+if (($queryOutput -join "`n") -notmatch "STATE\s*:\s*\d+\s+RUNNING") {
     Fail-Step "VerifyServiceStatus" "Service is not in RUNNING state. sc query output: `n$($queryOutput -join "`n")"
 }
 

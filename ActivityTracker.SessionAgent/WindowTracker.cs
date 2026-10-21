@@ -43,10 +43,8 @@ public class WindowTracker
     private CancellationTokenSource? _cts;
     private Timer? _heartbeatTimer;
 
-    // Track the current foreground window for heartbeat re-reporting
-    private string _currentFgProcess = "";
-    private string _currentFgTitle = "";
-    private readonly object _fgLock = new();
+    private readonly object _debounceLock = new();
+    private bool _transientIgnored;
 
     public WindowTracker(TrackerConfig config)
     {
@@ -136,9 +134,13 @@ public class WindowTracker
 
     public void ForceReport()
     {
-        // Clear debounce state so the current window is guaranteed to be re-reported
-        _lastReportedProcess = "";
-        _lastReportedTitle = "";
+        lock (_debounceLock)
+        {
+            // Clear debounce state so the current window is guaranteed to be re-reported
+            _lastReportedProcess = "";
+            _lastReportedTitle = "";
+            _transientIgnored = false;
+        }
         
         LogForegroundWindow(GetForegroundWindow());
     }
@@ -155,17 +157,14 @@ public class WindowTracker
 
     private void HeartbeatTick(object? state)
     {
-        // Re-report the current foreground window. The service dedupes identical events.
-        string process, title;
-        lock (_fgLock)
+        try
         {
-            process = _currentFgProcess;
-            title = _currentFgTitle;
+            var hwnd = GetForegroundWindow();
+            LogForegroundWindow(hwnd);
         }
-
-        if (!string.IsNullOrEmpty(process))
+        catch (Exception ex)
         {
-            EnqueueEvent(process, title);
+            FileLogger.LogError($"Error in HeartbeatTick: {ex.Message}");
         }
     }
 
@@ -177,26 +176,27 @@ public class WindowTracker
         var processName = GetProcessName(pid);
         var title = GetWindowTitle(hwnd);
 
-        if (ShouldIgnore(processName)) return;
-
-        // Debounce duplicates
-        if (_lastReportedProcess == processName && _lastReportedTitle == title)
-            return;
-
-        _lastReportedProcess = processName;
-        _lastReportedTitle = title;
-
-        // Track current foreground for heartbeat
-        lock (_fgLock)
+        lock (_debounceLock)
         {
-            _currentFgProcess = processName;
-            _currentFgTitle = title;
+            if (ShouldIgnore(processName, title))
+            {
+                _transientIgnored = true;
+                return;
+            }
+
+            // Debounce duplicates unless a transient window was ignored in between
+            if (!_transientIgnored && _lastReportedProcess == processName && _lastReportedTitle == title)
+                return;
+
+            _transientIgnored = false;
+            _lastReportedProcess = processName;
+            _lastReportedTitle = title;
+
+            // Never log window titles in sessionagent.log — log process name only.
+            FileLogger.LogInfo($"Foreground: {processName}");
+
+            EnqueueEvent(processName, title);
         }
-
-        // Never log window titles in sessionagent.log — log process name only.
-        FileLogger.LogInfo($"Foreground: {processName}");
-
-        EnqueueEvent(processName, title);
     }
 
     private void EnqueueEvent(string processName, string title)
@@ -272,18 +272,38 @@ public class WindowTracker
 
     private static string NormalizeProcessName(string name)
     {
+        if (string.IsNullOrEmpty(name))
+            return string.Empty;
         if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             return name[..^4];
         return name;
     }
 
-    private bool ShouldIgnore(string processName)
+    private bool ShouldIgnore(string processName, string title)
     {
         var normalized = NormalizeProcessName(processName).ToLowerInvariant();
         
         // Hardcoded exclusions for lock screen to prevent double-counting locked time
         if (normalized == "lockapp" || normalized == "logonui")
             return true;
+
+        // Transient shell UI flyouts: Quick settings, Start, Search
+        if (normalized is "shellhost" or "shellexperiencehost" or "searchhost" or "startmenuexperiencehost")
+            return true;
+
+        // Explorer transient windows (Task Switching, Task View, UnlockingWindow, or empty title)
+        // Keep "Program Manager" (desktop) and normal File Explorer folders as normal windows.
+        if (normalized == "explorer")
+        {
+            var trimmedTitle = title?.Trim() ?? string.Empty;
+            if (string.IsNullOrEmpty(trimmedTitle) ||
+                string.Equals(trimmedTitle, "Task Switching", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(trimmedTitle, "Task View", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(trimmedTitle, "UnlockingWindow", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
             
         if (_config.ExcludeProcesses.Count > 0 && _config.ExcludeProcesses.Exists(p => NormalizeProcessName(p).ToLowerInvariant() == normalized))
             return true;

@@ -10,11 +10,14 @@ namespace ActivityTracker.Core.Data;
 public class DatabaseManager
 {
     private readonly string _connectionString;
+    private readonly bool _isReadOnly;
     private readonly ILogger? _logger;
+    private const int SqliteBusyCode = 5;
 
     public DatabaseManager(ILogger<DatabaseManager>? logger = null)
     {
         _logger = logger;
+        _isReadOnly = false;
 
         var dbPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -42,6 +45,7 @@ public class DatabaseManager
     public DatabaseManager(bool readOnly, ILogger? logger = null)
     {
         _logger = logger;
+        _isReadOnly = readOnly;
 
         var dbPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
@@ -57,10 +61,29 @@ public class DatabaseManager
         }.ToString();
     }
 
+    private SqliteConnection CreateAndOpenConnection()
+    {
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA busy_timeout=5000;";
+            command.ExecuteNonQuery();
+
+            if (!_isReadOnly)
+            {
+                command.CommandText = "PRAGMA journal_mode=WAL;";
+                command.ExecuteNonQuery();
+            }
+        }
+
+        return connection;
+    }
+
     private void InitializeSchema()
     {
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
+        using var connection = CreateAndOpenConnection();
 
         using var command = connection.CreateCommand();
         command.CommandText = @"
@@ -144,8 +167,7 @@ public class DatabaseManager
 
     public long InsertEvent(EventRecord record)
     {
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
+        using var connection = CreateAndOpenConnection();
 
         using var command = connection.CreateCommand();
         command.CommandText = @"
@@ -165,42 +187,57 @@ public class DatabaseManager
 
     public void UpdateEventEndTime(long id, long endTime)
     {
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
-
-        // Fetch start_time to validate before writing
-        using var checkCmd = connection.CreateCommand();
-        checkCmd.CommandText = "SELECT start_time, process_or_domain FROM events WHERE id = @id;";
-        checkCmd.Parameters.AddWithValue("@id", id);
-
-        using var reader = checkCmd.ExecuteReader();
-        if (!reader.Read()) return; // row already deleted
-
-        var startTime = reader.GetInt64(0);
-        var processOrDomain = reader.GetString(1);
-        reader.Close();
-
-        if (endTime < startTime)
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            // Negative duration — CLAMP end = start and log a warning (do not delete).
-            _logger?.LogWarning(
-                "Negative-duration event clamped: id={EventId}, process={Process}, start_time={StartTime}, end_time={EndTime} → clamped to start_time",
-                id, processOrDomain, startTime, endTime);
-            endTime = startTime;
-        }
+            try
+            {
+                using var connection = CreateAndOpenConnection();
 
-        using var command = connection.CreateCommand();
-        // Only update rows whose end_time is still NULL so closed rows are never overwritten.
-        command.CommandText = "UPDATE events SET end_time = @end_time WHERE id = @id AND end_time IS NULL;";
-        command.Parameters.AddWithValue("@end_time", endTime);
-        command.Parameters.AddWithValue("@id", id);
-        command.ExecuteNonQuery();
+                // Fetch start_time to validate before writing
+                using var checkCmd = connection.CreateCommand();
+                checkCmd.CommandText = "SELECT start_time, process_or_domain FROM events WHERE id = @id;";
+                checkCmd.Parameters.AddWithValue("@id", id);
+
+                using var reader = checkCmd.ExecuteReader();
+                if (!reader.Read()) return; // row already deleted
+
+                var startTime = reader.GetInt64(0);
+                var processOrDomain = reader.GetString(1);
+                reader.Close();
+
+                if (endTime < startTime)
+                {
+                    // Negative duration — CLAMP end = start and log a warning (do not delete).
+                    _logger?.LogWarning(
+                        "Negative-duration event clamped: id={EventId}, process={Process}, start_time={StartTime}, end_time={EndTime} → clamped to start_time",
+                        id, processOrDomain, startTime, endTime);
+                    endTime = startTime;
+                }
+
+                using var command = connection.CreateCommand();
+                // Only update rows whose end_time is still NULL so closed rows are never overwritten.
+                command.CommandText = "UPDATE events SET end_time = @end_time WHERE id = @id AND end_time IS NULL;";
+                command.Parameters.AddWithValue("@end_time", endTime);
+                command.Parameters.AddWithValue("@id", id);
+                command.ExecuteNonQuery();
+
+                return;
+            }
+            catch (SqliteException ex) when (attempt == 0 && IsSqliteBusy(ex))
+            {
+                _logger?.LogWarning(ex, "Database busy (SQLITE_BUSY) in UpdateEventEndTime for id={EventId}. Retrying once...", id);
+                Thread.Sleep(100);
+            }
+        }
+    }
+
+    private static bool IsSqliteBusy(SqliteException ex)
+    {
+        return ex.SqliteErrorCode == SqliteBusyCode || (ex.SqliteExtendedErrorCode & 0xFF) == SqliteBusyCode;
     }
     
     public SqliteConnection GetConnection()
     {
-        var conn = new SqliteConnection(_connectionString);
-        conn.Open();
-        return conn;
+        return CreateAndOpenConnection();
     }
 }
