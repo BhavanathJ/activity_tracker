@@ -160,7 +160,19 @@ public class WindowTracker
         try
         {
             var hwnd = GetForegroundWindow();
-            LogForegroundWindow(hwnd);
+            if (hwnd == IntPtr.Zero) return;
+
+            GetWindowThreadProcessId(hwnd, out uint pid);
+            var processName = GetProcessName(pid);
+            var title = GetWindowTitle(hwnd);
+
+            lock (_debounceLock)
+            {
+                if (ShouldIgnore(processName, title))
+                    return;
+
+                EnqueueEvent(processName, title);
+            }
         }
         catch (Exception ex)
         {
