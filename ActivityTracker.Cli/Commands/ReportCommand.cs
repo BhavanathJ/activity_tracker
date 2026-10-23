@@ -249,9 +249,7 @@ public class ReportCommand : Command<ReportCommand.Settings>
                 _ => "white"
             };
 
-            var appStr = !string.IsNullOrEmpty(ev.Browser)
-                ? $"{ev.ProcessOrDomain} [dim]({ev.Browser})[/]"
-                : ev.ProcessOrDomain;
+            var appStr = Markup.Escape(ev.ProcessOrDomain) + (string.IsNullOrEmpty(ev.Browser) ? "" : $" [dim]({Markup.Escape(ev.Browser)})[/]");
 
             var durationStr = duration < 0
                 ? $"[red]{duration}s[/]"
@@ -262,7 +260,7 @@ public class ReportCommand : Command<ReportCommand.Settings>
                 startStr,
                 endStr,
                 durationStr,
-                $"[{typeColor}]{Markup.Escape(appStr)}[/]",
+                $"[{typeColor}]{appStr}[/]",
                 Markup.Escape(ev.Title)
             );
         }
