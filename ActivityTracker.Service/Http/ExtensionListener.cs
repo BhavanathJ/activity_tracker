@@ -41,6 +41,8 @@ public class ExtensionListener
     // Idle state from SessionAgent input-idle reports
     private bool _inputIdle;
     private bool _mediaActive;
+    private long _lastMediaTrueUnix;
+    private const int MediaGraceSeconds = 20;
     private bool _effectiveIdle;
     private DateTimeOffset _lastInputIdleBackdate = DateTimeOffset.UtcNow;
 
@@ -621,14 +623,11 @@ public class ExtensionListener
 
     private bool RecomputeMediaActiveLocked(long nowUnix)
     {
-        foreach (var entry in _mediaSources.Values)
-        {
-            if (entry.Playing && (nowUnix - entry.LastSeenUnix) < 90)
-            {
-                return true;
-            }
-        }
-        return false;
+        bool anyPlaying = false;
+        foreach (var e in _mediaSources.Values)
+            if (e.Playing && (nowUnix - e.LastSeenUnix) < 90) { anyPlaying = true; break; }
+        if (anyPlaying) _lastMediaTrueUnix = nowUnix;
+        return anyPlaying || (_lastMediaTrueUnix != 0 && (nowUnix - _lastMediaTrueUnix) < MediaGraceSeconds);
     }
 
     private void HandleMediaEvent(MediaEventPayload payload)
