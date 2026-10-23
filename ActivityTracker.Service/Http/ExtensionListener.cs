@@ -687,7 +687,11 @@ public class ExtensionListener
 
             if (!fromMediaChange)
             {
-                _dbManager.TrimEventsAfter(closeTime.ToUnixTimeSeconds());
+                var ageSeconds = (DateTimeOffset.UtcNow - closeTime).TotalSeconds;
+                if (ageSeconds <= _config.IdleTimeoutSeconds + 60)
+                    _dbManager.TrimEventsAfter(closeTime.ToUnixTimeSeconds());
+                else
+                    _logger.LogInformation("Skipping trim: stale idle backdate ({Seconds:F0}s).", ageSeconds);
             }
         }
         else if (_effectiveIdle && !newEffectiveIdle)
