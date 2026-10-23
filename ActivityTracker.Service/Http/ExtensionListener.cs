@@ -635,7 +635,7 @@ public class ExtensionListener
         lock (_sessionLock)
         {
             var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var sourceKey = $"{payload.Source}:{payload.Process}";
+            var sourceKey = payload.Source == "agent" ? "agent" : $"{payload.Source}:{payload.Process}";
             _mediaSources[sourceKey] = (payload.Playing, nowUnix);
 
             bool newMediaActive = RecomputeMediaActiveLocked(nowUnix);
