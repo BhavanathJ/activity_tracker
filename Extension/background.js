@@ -187,23 +187,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // ---------- Idle / lock detection ----------
 
 chrome.idle.onStateChanged.addListener(async (state) => {
-  if (state === 'locked') {
-    await sendBlur();
-  } else if (state === 'idle') {
-    let tabAudible = false;
-    try {
-      if (await isBrowserFocused()) {
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        if (tab && tab.audible === true) {
-          tabAudible = true;
-        }
-      }
-    } catch (_) {}
-
-    if (!tabAudible) {
-      await sendBlur();
-    }
-  } else if (state === 'active') {
+  if (state === 'active') {
     await sendActiveTab();
   }
   await sendMedia();

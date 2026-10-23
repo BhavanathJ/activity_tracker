@@ -231,6 +231,59 @@ public class DatabaseManager
         }
     }
 
+    public int TrimEventsAfter(long backdateUnix)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                using var connection = CreateAndOpenConnection();
+                using var transaction = connection.BeginTransaction();
+
+                int rowsTrimmed = 0;
+
+                using (var command1 = connection.CreateCommand())
+                {
+                    command1.Transaction = transaction;
+                    command1.CommandText = @"
+                        UPDATE events
+                        SET end_time = @backdateUnix
+                        WHERE type IN ('window', 'browser')
+                          AND start_time < @backdateUnix
+                          AND end_time > @backdateUnix;";
+                    command1.Parameters.AddWithValue("@backdateUnix", backdateUnix);
+                    rowsTrimmed += command1.ExecuteNonQuery();
+                }
+
+                using (var command2 = connection.CreateCommand())
+                {
+                    command2.Transaction = transaction;
+                    command2.CommandText = @"
+                        UPDATE events
+                        SET end_time = start_time
+                        WHERE type IN ('window', 'browser')
+                          AND start_time >= @backdateUnix
+                          AND end_time IS NOT NULL
+                          AND end_time > start_time;";
+                    command2.Parameters.AddWithValue("@backdateUnix", backdateUnix);
+                    rowsTrimmed += command2.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+
+                _logger?.LogInformation("Trimmed {Count} rows after backdate {BackdateUnix}.", rowsTrimmed, backdateUnix);
+                return rowsTrimmed;
+            }
+            catch (SqliteException ex) when (attempt == 0 && IsSqliteBusy(ex))
+            {
+                _logger?.LogWarning(ex, "Database busy (SQLITE_BUSY) in TrimEventsAfter for backdateUnix={BackdateUnix}. Retrying once...", backdateUnix);
+                Thread.Sleep(100);
+            }
+        }
+
+        return 0;
+    }
+
     private static bool IsSqliteBusy(SqliteException ex)
     {
         return ex.SqliteErrorCode == SqliteBusyCode || (ex.SqliteExtendedErrorCode & 0xFF) == SqliteBusyCode;

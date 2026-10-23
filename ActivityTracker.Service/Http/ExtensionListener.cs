@@ -685,6 +685,11 @@ public class ExtensionListener
 
             _windowSessionManager.CloseCurrentSession(closeTime);
             CloseAllBrowserSessions(closeTime);
+
+            if (!fromMediaChange)
+            {
+                _dbManager.TrimEventsAfter(closeTime.ToUnixTimeSeconds());
+            }
         }
         else if (_effectiveIdle && !newEffectiveIdle)
         {
