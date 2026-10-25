@@ -110,10 +110,11 @@ public class MediaMonitor
                         // 2. NEW per-process audio-session check IsForegroundProcessRenderingAudio(fgProcessName)
                         bool comThrewException = false;
                         bool isRenderingAudio = false;
+                        string audioSessionReason = "";
 
                         try
                         {
-                            isRenderingAudio = IsForegroundProcessRenderingAudio(fgProcess);
+                            isRenderingAudio = IsForegroundProcessRenderingAudio(fgProcess, out audioSessionReason);
                         }
                         catch (Exception ex)
                         {
@@ -126,7 +127,7 @@ public class MediaMonitor
                             if (isRenderingAudio)
                             {
                                 isPlaying = true;
-                                reason = "audio-session";
+                                reason = audioSessionReason;
                             }
                             else
                             {
@@ -307,16 +308,17 @@ public class MediaMonitor
         return false;
     }
 
-    private static bool IsForegroundProcessRenderingAudio(string fgProcessName)
+    private static bool s_hasLoggedMeterQi = false;
+    private static readonly Guid IID_IAudioMeterInformation = new("C02216F6-038E-4B54-9D00-D008E73E0064");
+
+    private static bool IsForegroundProcessRenderingAudio(string fgProcessName, out string reason)
     {
+        reason = "";
         if (string.IsNullOrEmpty(fgProcessName))
             return false;
 
         IMMDeviceEnumerator? enumerator = null;
-        IMMDevice? device = null;
-        IAudioSessionManager2? sessionManager = null;
-        IAudioSessionEnumerator? sessionEnum = null;
-        var sessionsToRelease = new List<IAudioSessionControl>();
+        IMMDeviceCollection? deviceCollection = null;
 
         try
         {
@@ -328,92 +330,150 @@ public class MediaMonitor
             if (enumerator == null)
                 throw new InvalidOperationException("Could not create MMDeviceEnumerator.");
 
-            // 0 = eRender, 0 = eConsole (fallback to 1 = eMultimedia)
-            int hr = enumerator.GetDefaultAudioEndpoint(0, 0, out device);
-            if (hr != 0 || device == null)
+            // Enumerate ALL active render endpoints (eRender=0, DEVICE_STATE_ACTIVE=1)
+            int hr = enumerator.EnumAudioEndpoints(0, 1, out deviceCollection);
+            if (hr != 0 || deviceCollection == null)
             {
-                hr = enumerator.GetDefaultAudioEndpoint(0, 1, out device);
-                if (hr != 0 || device == null)
-                {
-                    throw new COMException("Failed to get default audio endpoint", hr);
-                }
+                throw new COMException("EnumAudioEndpoints failed", hr);
             }
 
-            Guid iidSessionManager2 = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
-            hr = device.Activate(ref iidSessionManager2, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out object sessionMgrObj);
-            if (hr != 0 || sessionMgrObj is not IAudioSessionManager2 sm)
-            {
-                throw new COMException("Failed to activate IAudioSessionManager2", hr);
-            }
-            sessionManager = sm;
-
-            hr = sessionManager.GetSessionEnumerator(out sessionEnum);
-            if (hr != 0 || sessionEnum == null)
-            {
-                throw new COMException("Failed to get session enumerator", hr);
-            }
-
-            hr = sessionEnum.GetCount(out int count);
+            hr = deviceCollection.GetCount(out uint deviceCount);
             if (hr != 0)
             {
-                throw new COMException("Failed to get session count", hr);
+                throw new COMException("IMMDeviceCollection.GetCount failed", hr);
             }
 
-            var activeMatchingMeters = new List<IAudioMeterInformation>();
-
-            for (int i = 0; i < count; i++)
+            for (uint d = 0; d < deviceCount; d++)
             {
-                if (sessionEnum.GetSession(i, out IAudioSessionControl sessionControl) != 0 || sessionControl == null)
-                    continue;
+                IMMDevice? device = null;
+                IAudioSessionManager2? sessionManager = null;
+                IAudioSessionEnumerator? sessionEnum = null;
+                var sessionsToRelease = new List<IAudioSessionControl>();
 
-                sessionsToRelease.Add(sessionControl);
-
-                if (sessionControl is not IAudioSessionControl2 sessionControl2)
-                    continue;
-
-                if (sessionControl2.GetProcessId(out uint pid) != 0 || pid == 0)
-                    continue;
-
-                string sessionProcName;
                 try
                 {
-                    using var proc = Process.GetProcessById((int)pid);
-                    sessionProcName = proc.ProcessName;
-                }
-                catch
-                {
-                    continue;
-                }
+                    if (deviceCollection.Item(d, out device) != 0 || device == null)
+                        continue;
 
-                if (!string.Equals(sessionProcName, fgProcessName, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                if (sessionControl2.GetState(out int state) != 0 || state != 1 /* AudioSessionStateActive */)
-                    continue;
-
-                if (sessionControl is IAudioMeterInformation meter)
-                {
-                    activeMatchingMeters.Add(meter);
-                }
-            }
-
-            if (activeMatchingMeters.Count == 0)
-                return false;
-
-            // Sample 3 times 150 ms apart (return true on the first sample above threshold)
-            for (int sample = 0; sample < 3; sample++)
-            {
-                foreach (var meter in activeMatchingMeters)
-                {
-                    if (meter.GetPeakValue(out float peak) == 0 && peak > 0.001f)
+                    Guid iidSessionManager2 = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+                    if (device.Activate(ref iidSessionManager2, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out object sessionMgrObj) != 0 ||
+                        sessionMgrObj is not IAudioSessionManager2 sm)
                     {
-                        return true;
+                        continue;
+                    }
+                    sessionManager = sm;
+
+                    if (sessionManager.GetSessionEnumerator(out sessionEnum) != 0 || sessionEnum == null)
+                        continue;
+
+                    if (sessionEnum.GetCount(out int sessionCount) != 0)
+                        continue;
+
+                    for (int i = 0; i < sessionCount; i++)
+                    {
+                        if (sessionEnum.GetSession(i, out IAudioSessionControl sessionControl) != 0 || sessionControl == null)
+                            continue;
+
+                        sessionsToRelease.Add(sessionControl);
+
+                        if (sessionControl is not IAudioSessionControl2 sessionControl2)
+                            continue;
+
+                        if (sessionControl2.GetProcessId(out uint pid) != 0 || pid == 0)
+                            continue;
+
+                        string sessionProcName;
+                        try
+                        {
+                            using var proc = Process.GetProcessById((int)pid);
+                            sessionProcName = proc.ProcessName;
+                        }
+                        catch
+                        {
+                            continue;
+                        }
+
+                        if (!string.Equals(sessionProcName, fgProcessName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        if (sessionControl2.GetState(out int state) != 0 || state != 1 /* AudioSessionStateActive */)
+                            continue;
+
+                        // 3a. Try to get the meter: Marshal.GetIUnknownForObject -> Marshal.QueryInterface -> Marshal.GetObjectForIUnknown
+                        IntPtr unkPtr = IntPtr.Zero;
+                        IntPtr meterPtr = IntPtr.Zero;
+                        IAudioMeterInformation? meter = null;
+                        try
+                        {
+                            unkPtr = Marshal.GetIUnknownForObject(sessionControl);
+                            Guid iidMeter = IID_IAudioMeterInformation;
+                            int qiHr = Marshal.QueryInterface(unkPtr, ref iidMeter, out meterPtr);
+                            if (!s_hasLoggedMeterQi)
+                            {
+                                s_hasLoggedMeterQi = true;
+                                FileLogger.LogInfo($"Audio session meter QI hr=0x{qiHr:X8}");
+                            }
+
+                            if (qiHr == 0 && meterPtr != IntPtr.Zero)
+                            {
+                                meter = Marshal.GetObjectForIUnknown(meterPtr) as IAudioMeterInformation;
+                            }
+                        }
+                        finally
+                        {
+                            if (meterPtr != IntPtr.Zero) Marshal.Release(meterPtr);
+                            if (unkPtr != IntPtr.Zero) Marshal.Release(unkPtr);
+                        }
+
+                        // 3b. If the meter is obtained: sample GetPeakValue up to 3 times, 150 ms apart; peak > 0.001 on any sample => playing, reason "audio-session". All zero => NOT playing for this session.
+                        if (meter != null)
+                        {
+                            bool peakDetected = false;
+                            try
+                            {
+                                for (int sample = 0; sample < 3; sample++)
+                                {
+                                    if (meter.GetPeakValue(out float peak) == 0 && peak > 0.001f)
+                                    {
+                                        peakDetected = true;
+                                        break;
+                                    }
+
+                                    if (sample < 2)
+                                    {
+                                        Thread.Sleep(150);
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                try { Marshal.ReleaseComObject(meter); } catch { }
+                            }
+
+                            if (peakDetected)
+                            {
+                                reason = "audio-session";
+                                return true;
+                            }
+                            // All zero => NOT playing for this session. Continue checking other sessions/devices.
+                        }
+                        else
+                        {
+                            // 3c. If the meter is NOT obtainable (QI failed): treat Active state alone as playing, reason "audio-session-state".
+                            reason = "audio-session-state";
+                            return true;
+                        }
                     }
                 }
-
-                if (sample < 2)
+                finally
                 {
-                    Thread.Sleep(150);
+                    foreach (var session in sessionsToRelease)
+                    {
+                        try { Marshal.ReleaseComObject(session); } catch { }
+                    }
+                    if (sessionEnum != null) { try { Marshal.ReleaseComObject(sessionEnum); } catch { } }
+                    if (sessionManager != null) { try { Marshal.ReleaseComObject(sessionManager); } catch { } }
+                    if (device != null) { try { Marshal.ReleaseComObject(device); } catch { } }
                 }
             }
 
@@ -421,13 +481,7 @@ public class MediaMonitor
         }
         finally
         {
-            foreach (var session in sessionsToRelease)
-            {
-                try { Marshal.ReleaseComObject(session); } catch { }
-            }
-            if (sessionEnum != null) { try { Marshal.ReleaseComObject(sessionEnum); } catch { } }
-            if (sessionManager != null) { try { Marshal.ReleaseComObject(sessionManager); } catch { } }
-            if (device != null) { try { Marshal.ReleaseComObject(device); } catch { } }
+            if (deviceCollection != null) { try { Marshal.ReleaseComObject(deviceCollection); } catch { } }
             if (enumerator != null) { try { Marshal.ReleaseComObject(enumerator); } catch { } }
         }
     }
@@ -496,12 +550,24 @@ public class MediaMonitor
     }
 
     [ComImport]
+    [Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDeviceCollection
+    {
+        [PreserveSig]
+        int GetCount(out uint pcDevices);
+
+        [PreserveSig]
+        int Item(uint nDevice, out IMMDevice ppDevice);
+    }
+
+    [ComImport]
     [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IMMDeviceEnumerator
     {
         [PreserveSig]
-        int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+        int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IMMDeviceCollection ppDevices);
 
         [PreserveSig]
         int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
