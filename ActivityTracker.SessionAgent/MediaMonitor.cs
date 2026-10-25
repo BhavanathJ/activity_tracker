@@ -459,9 +459,103 @@ public class MediaMonitor
                         }
                         else
                         {
-                            // 3c. If the meter is NOT obtainable (QI failed): treat Active state alone as playing, reason "audio-session-state".
-                            reason = "audio-session-state";
-                            return true;
+                            // Session meter QI was NOT obtainable.
+                            // 1. Get the device-level meter for the SAME device being enumerated:
+                            Guid iidDeviceMeter = IID_IAudioMeterInformation;
+                            int meterHr = device.Activate(ref iidDeviceMeter, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out object deviceMeterObj);
+                            IAudioMeterInformation? deviceMeter = null;
+                            if (meterHr == 0 && deviceMeterObj is IAudioMeterInformation dm)
+                            {
+                                deviceMeter = dm;
+                            }
+
+                            if (deviceMeter == null)
+                            {
+                                // 3d. device meter cannot be obtained => old behaviour: playing, reason "audio-session-state"
+                                reason = "audio-session-state";
+                                return true;
+                            }
+
+                            bool devicePeakDetected = false;
+                            try
+                            {
+                                // 3a. device peak > 0.001 on any of 3 samples 150 ms apart => playing, reason "audio-session-peak"
+                                for (int sample = 0; sample < 3; sample++)
+                                {
+                                    if (deviceMeter.GetPeakValue(out float peak) == 0 && peak > 0.001f)
+                                    {
+                                        devicePeakDetected = true;
+                                        break;
+                                    }
+
+                                    if (sample < 2)
+                                    {
+                                        Thread.Sleep(150);
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                try { Marshal.ReleaseComObject(deviceMeter); } catch { }
+                            }
+
+                            if (devicePeakDetected)
+                            {
+                                reason = "audio-session-peak";
+                                return true;
+                            }
+
+                            // 2. Count OTHER active sessions on this device:
+                            int otherActiveSessions = 0;
+                            if (sessionEnum.GetCount(out int totalCount) == 0)
+                            {
+                                for (int j = 0; j < totalCount; j++)
+                                {
+                                    if (sessionEnum.GetSession(j, out IAudioSessionControl otherControl) != 0 || otherControl == null)
+                                        continue;
+
+                                    try
+                                    {
+                                        if (otherControl is not IAudioSessionControl2 otherControl2)
+                                            continue;
+
+                                        if (otherControl2.GetProcessId(out uint otherPid) != 0 || otherPid == 0)
+                                            continue;
+
+                                        string otherProcName;
+                                        try
+                                        {
+                                            using var otherProc = Process.GetProcessById((int)otherPid);
+                                            otherProcName = otherProc.ProcessName;
+                                        }
+                                        catch
+                                        {
+                                            continue;
+                                        }
+
+                                        if (string.Equals(otherProcName, fgProcessName, StringComparison.OrdinalIgnoreCase))
+                                            continue;
+
+                                        if (otherControl2.GetState(out int otherState) != 0 || otherState != 1 /* AudioSessionStateActive */)
+                                            continue;
+
+                                        otherActiveSessions++;
+                                    }
+                                    finally
+                                    {
+                                        try { Marshal.ReleaseComObject(otherControl); } catch { }
+                                    }
+                                }
+                            }
+
+                            if (otherActiveSessions > 0)
+                            {
+                                // 3c. device peak all zero BUT other active sessions exist => ambiguous; keep old behaviour: playing, reason "audio-session-state"
+                                reason = "audio-session-state";
+                                return true;
+                            }
+
+                            // 3b. device peak all zero AND no other active sessions => NOT playing for this session (paused). Continue to other sessions/devices.
                         }
                     }
                 }
