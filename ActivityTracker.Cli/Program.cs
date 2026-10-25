@@ -13,6 +13,8 @@ public class Program
         {
             config.AddCommand<ReportCommand>("report")
                 .WithDescription("Generates an activity report.");
+            config.AddCommand<LiveCommand>("live")
+                .WithDescription("Shows what the tracker is recording right now, refreshing in place.");
         });
 
         return app.Run(args);

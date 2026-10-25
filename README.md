@@ -128,6 +128,25 @@ ActivityTracker.Cli.exe report --raw chrome --date 2026-10-18
 
 ---
 
+### Live View
+Monitor what the tracker is recording right now, refreshing in place:
+```cmd
+ActivityTracker.Cli.exe live
+ActivityTracker.Cli.exe live --interval 5
+```
+The live dashboard shows current state (ACTIVE / LOCKED / IDLE), the focused window and browser tab, today's top apps/domains/audio, and recent events. Press `Ctrl+C` to exit cleanly.
+
+If output is piped or redirected, a single snapshot is printed and the command exits immediately.
+
+**PowerShell alias (optional):**
+```powershell
+Set-Alias tracker "C:\ProgramData\ActivityTracker\ActivityTracker.Cli.exe"
+tracker live
+tracker report --today
+```
+
+---
+
 ## Troubleshooting
 
 ### Service State
