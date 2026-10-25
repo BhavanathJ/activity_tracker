@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,14 +21,17 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Extract version from tag
+      - name: Extract version
         id: version
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          $ver = $tag -replace '^v', ''
-          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
-          echo "Version: $ver"
+          if ('${{ github.ref }}' -like 'refs/tags/v*') {
+            $ver = '${{ github.ref_name }}' -replace '^v', ''
+          } else {
+            $ver = '0.0.0-dev'
+          }
+          "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $ver"
 
       - name: Publish Service
         shell: pwsh
@@ -64,27 +68,38 @@ jobs:
           /DCliDir=out\cli
           installer\ActivityTracker.iss
 
-      - name: Create Extension zip
+      - name: Create Extension zips
         shell: pwsh
         run: |
-          Compress-Archive -Path Extension\* -DestinationPath installer\output\ActivityTracker-Extension-${{ steps.version.outputs.VERSION }}.zip
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          New-Item -ItemType Directory -Path "installer/output" -Force
+          foreach ($browser in @("brave", "chrome", "edge")) {
+            $stageDir = "out/ext-$browser"
+            New-Item -ItemType Directory -Path $stageDir -Force
+            Copy-Item -Path "Extension/*" -Destination $stageDir -Recurse -Exclude "config.js"
+            Copy-Item -Path "installer/ext-config/$browser/config.js" -Destination "$stageDir/config.js"
+            Compress-Archive -Path "$stageDir/*" -DestinationPath "installer/output/ActivityTracker-Extension-$browser-$ver.zip" -Force
+          }
 
       - name: Compute checksums
         shell: pwsh
         run: |
-          $setupExe = "installer\output\ActivityTracker-Setup-${{ steps.version.outputs.VERSION }}.exe"
-          $extZip   = "installer\output\ActivityTracker-Extension-${{ steps.version.outputs.VERSION }}.zip"
-
           $lines = @()
-          foreach ($file in @($setupExe, $extZip)) {
-            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash
-            $name = Split-Path $file -Leaf
-            $lines += "$hash  $name"
+          Get-ChildItem -Path "installer\output" -File | Where-Object { $_.Name -ne "checksums.txt" } | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
+            $lines += "$hash  $($_.Name)"
           }
           $lines | Set-Content "installer\output\checksums.txt"
           Get-Content "installer\output\checksums.txt"
 
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: ActivityTracker-${{ steps.version.outputs.VERSION }}
+          path: installer/output/*
+
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2.0.8
         with:
           name: Activity Tracker v${{ steps.version.outputs.VERSION }}
@@ -94,12 +109,10 @@ jobs:
             ### Installation
             1. Download `ActivityTracker-Setup-${{ steps.version.outputs.VERSION }}.exe` below.
             2. Run it and follow the installer prompts.
-            3. After install, load the browser extension from the `extension` folder (see README).
+            3. After install, load the browser extension for your browser (Chrome, Brave, or Edge).
             4. Open a new terminal and run `tracker live` to verify.
 
             ### Verify download
             Compare the SHA-256 hash of your downloaded file against `checksums.txt`.
           files: |
-            installer/output/ActivityTracker-Setup-${{ steps.version.outputs.VERSION }}.exe
-            installer/output/ActivityTracker-Extension-${{ steps.version.outputs.VERSION }}.zip
-            installer/output/checksums.txt
+            installer/output/*

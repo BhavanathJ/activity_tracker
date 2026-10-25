@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices;
@@ -17,6 +18,7 @@ public class MediaMonitor
 
     private bool? _lastReportedPlaying;
     private string _lastReportedProcess = "";
+    private string _lastReportedReason = "";
     private DateTimeOffset _lastPostTime = DateTimeOffset.MinValue;
     private readonly object _pollLock = new();
 
@@ -47,6 +49,7 @@ public class MediaMonitor
         try
         {
             bool isPlaying = false;
+            string reason = "";
             string fgProcess = "";
 
             try
@@ -61,6 +64,7 @@ public class MediaMonitor
                     fgLower != "lockapp" &&
                     fgLower != "logonui")
                 {
+                    // 1. GSMTC match (unchanged) -> playing, reason "gsmtc".
                     bool sessionMatches = false;
                     try
                     {
@@ -99,16 +103,51 @@ public class MediaMonitor
                     if (sessionMatches)
                     {
                         isPlaying = true;
+                        reason = "gsmtc";
                     }
                     else
                     {
-                        bool isFullscreen = IsForegroundWindowFullscreen(fgHwnd);
-                        if (isFullscreen)
+                        // 2. NEW per-process audio-session check IsForegroundProcessRenderingAudio(fgProcessName)
+                        bool comThrewException = false;
+                        bool isRenderingAudio = false;
+
+                        try
                         {
-                            bool hasAudio = CheckAudioPeakAboveThreshold(0.001f);
-                            if (hasAudio)
+                            isRenderingAudio = IsForegroundProcessRenderingAudio(fgProcess);
+                        }
+                        catch (Exception ex)
+                        {
+                            FileLogger.LogWarn($"Audio session check error: {ex.Message}");
+                            comThrewException = true;
+                        }
+
+                        if (!comThrewException)
+                        {
+                            if (isRenderingAudio)
                             {
                                 isPlaying = true;
+                                reason = "audio-session";
+                            }
+                            else
+                            {
+                                // If enumeration succeeded and found nothing, playing = false.
+                                isPlaying = false;
+                                reason = "";
+                            }
+                        }
+                        else
+                        {
+                            // 3. FALLBACK ONLY if the COM enumeration threw an exception (not when it simply found no matching session):
+                            // the old logic (fullscreen AND default-device peak > 0.001), reason "fullscreen-peak".
+                            bool isFullscreen = IsForegroundWindowFullscreen(fgHwnd);
+                            if (isFullscreen)
+                            {
+                                bool hasAudio = CheckAudioPeakAboveThreshold(0.001f);
+                                if (hasAudio)
+                                {
+                                    isPlaying = true;
+                                    reason = "fullscreen-peak";
+                                }
                             }
                         }
                     }
@@ -118,21 +157,36 @@ public class MediaMonitor
             {
                 FileLogger.LogWarn($"Media check error: {ex.Message}");
                 isPlaying = false;
+                reason = "";
+            }
+
+            // 4. Log (FileLogger.LogInfo) only when isPlaying changes or the reason changes: "Media: playing={bool} reason={reason} process={fgProcess}". No per-poll logging; never log window titles.
+            bool playingChanged = _lastReportedPlaying != isPlaying;
+            bool reasonChanged = !string.Equals(_lastReportedReason, reason, StringComparison.OrdinalIgnoreCase);
+            bool processChangedWhilePlaying = isPlaying && !string.Equals(_lastReportedProcess, fgProcess, StringComparison.OrdinalIgnoreCase);
+
+            if (playingChanged || reasonChanged || processChangedWhilePlaying)
+            {
+                FileLogger.LogInfo($"Media: playing={isPlaying} reason={reason} process={fgProcess}");
             }
 
             var now = DateTimeOffset.UtcNow;
-            bool changed = (_lastReportedPlaying != isPlaying) ||
-                           (isPlaying && !string.Equals(_lastReportedProcess, fgProcess, StringComparison.OrdinalIgnoreCase));
+            bool statusChanged = playingChanged || processChangedWhilePlaying;
             bool heartbeatDue = (now - _lastPostTime) >= TimeSpan.FromSeconds(30);
 
-            if (changed || heartbeatDue)
+            if (statusChanged || heartbeatDue)
             {
                 if (PostMedia(isPlaying, fgProcess))
                 {
                     _lastReportedPlaying = isPlaying;
+                    _lastReportedReason = reason;
                     _lastReportedProcess = fgProcess;
                     _lastPostTime = now;
                 }
+            }
+            else if (reasonChanged)
+            {
+                _lastReportedReason = reason;
             }
         }
         finally
@@ -253,6 +307,131 @@ public class MediaMonitor
         return false;
     }
 
+    private static bool IsForegroundProcessRenderingAudio(string fgProcessName)
+    {
+        if (string.IsNullOrEmpty(fgProcessName))
+            return false;
+
+        IMMDeviceEnumerator? enumerator = null;
+        IMMDevice? device = null;
+        IAudioSessionManager2? sessionManager = null;
+        IAudioSessionEnumerator? sessionEnum = null;
+        var sessionsToRelease = new List<IAudioSessionControl>();
+
+        try
+        {
+            var enumeratorType = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
+            if (enumeratorType == null)
+                throw new InvalidOperationException("Could not get MMDeviceEnumerator type.");
+
+            enumerator = (IMMDeviceEnumerator?)Activator.CreateInstance(enumeratorType);
+            if (enumerator == null)
+                throw new InvalidOperationException("Could not create MMDeviceEnumerator.");
+
+            // 0 = eRender, 0 = eConsole (fallback to 1 = eMultimedia)
+            int hr = enumerator.GetDefaultAudioEndpoint(0, 0, out device);
+            if (hr != 0 || device == null)
+            {
+                hr = enumerator.GetDefaultAudioEndpoint(0, 1, out device);
+                if (hr != 0 || device == null)
+                {
+                    throw new COMException("Failed to get default audio endpoint", hr);
+                }
+            }
+
+            Guid iidSessionManager2 = new Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F");
+            hr = device.Activate(ref iidSessionManager2, 1 /* CLSCTX_INPROC_SERVER */, IntPtr.Zero, out object sessionMgrObj);
+            if (hr != 0 || sessionMgrObj is not IAudioSessionManager2 sm)
+            {
+                throw new COMException("Failed to activate IAudioSessionManager2", hr);
+            }
+            sessionManager = sm;
+
+            hr = sessionManager.GetSessionEnumerator(out sessionEnum);
+            if (hr != 0 || sessionEnum == null)
+            {
+                throw new COMException("Failed to get session enumerator", hr);
+            }
+
+            hr = sessionEnum.GetCount(out int count);
+            if (hr != 0)
+            {
+                throw new COMException("Failed to get session count", hr);
+            }
+
+            var activeMatchingMeters = new List<IAudioMeterInformation>();
+
+            for (int i = 0; i < count; i++)
+            {
+                if (sessionEnum.GetSession(i, out IAudioSessionControl sessionControl) != 0 || sessionControl == null)
+                    continue;
+
+                sessionsToRelease.Add(sessionControl);
+
+                if (sessionControl is not IAudioSessionControl2 sessionControl2)
+                    continue;
+
+                if (sessionControl2.GetProcessId(out uint pid) != 0 || pid == 0)
+                    continue;
+
+                string sessionProcName;
+                try
+                {
+                    using var proc = Process.GetProcessById((int)pid);
+                    sessionProcName = proc.ProcessName;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (!string.Equals(sessionProcName, fgProcessName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (sessionControl2.GetState(out int state) != 0 || state != 1 /* AudioSessionStateActive */)
+                    continue;
+
+                if (sessionControl is IAudioMeterInformation meter)
+                {
+                    activeMatchingMeters.Add(meter);
+                }
+            }
+
+            if (activeMatchingMeters.Count == 0)
+                return false;
+
+            // Sample 3 times 150 ms apart (return true on the first sample above threshold)
+            for (int sample = 0; sample < 3; sample++)
+            {
+                foreach (var meter in activeMatchingMeters)
+                {
+                    if (meter.GetPeakValue(out float peak) == 0 && peak > 0.001f)
+                    {
+                        return true;
+                    }
+                }
+
+                if (sample < 2)
+                {
+                    Thread.Sleep(150);
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            foreach (var session in sessionsToRelease)
+            {
+                try { Marshal.ReleaseComObject(session); } catch { }
+            }
+            if (sessionEnum != null) { try { Marshal.ReleaseComObject(sessionEnum); } catch { } }
+            if (sessionManager != null) { try { Marshal.ReleaseComObject(sessionManager); } catch { } }
+            if (device != null) { try { Marshal.ReleaseComObject(device); } catch { } }
+            if (enumerator != null) { try { Marshal.ReleaseComObject(enumerator); } catch { } }
+        }
+    }
+
     private static bool CheckAudioPeakAboveThreshold(float threshold)
     {
         try
@@ -353,6 +532,128 @@ public class MediaMonitor
 
         [PreserveSig]
         int GetState(out int pdwState);
+    }
+
+    [ComImport]
+    [Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioSessionManager2
+    {
+        [PreserveSig]
+        int GetAudioSessionControl(IntPtr audioSessionGuid, uint streamFlags, out IntPtr sessionControl);
+
+        [PreserveSig]
+        int GetSimpleAudioVolume(IntPtr audioSessionGuid, uint streamFlags, out IntPtr audioVolume);
+
+        [PreserveSig]
+        int GetSessionEnumerator(out IAudioSessionEnumerator sessionEnum);
+
+        [PreserveSig]
+        int RegisterSessionNotification(IntPtr newNotifications);
+
+        [PreserveSig]
+        int UnregisterSessionNotification(IntPtr newNotifications);
+
+        [PreserveSig]
+        int RegisterDuckNotification([MarshalAs(UnmanagedType.LPWStr)] string sessionId, IntPtr pDuckNotification);
+
+        [PreserveSig]
+        int UnregisterDuckNotification(IntPtr pDuckNotification);
+    }
+
+    [ComImport]
+    [Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioSessionEnumerator
+    {
+        [PreserveSig]
+        int GetCount(out int sessionCount);
+
+        [PreserveSig]
+        int GetSession(int sessionIndex, out IAudioSessionControl session);
+    }
+
+    [ComImport]
+    [Guid("F4B1A599-7266-4319-A8CA-E70ACB11E8CD")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioSessionControl
+    {
+        [PreserveSig]
+        int GetState(out int state);
+
+        [PreserveSig]
+        int GetDisplayName(out IntPtr displayName);
+
+        [PreserveSig]
+        int SetDisplayName([MarshalAs(UnmanagedType.LPWStr)] string displayName, ref Guid eventContext);
+
+        [PreserveSig]
+        int GetIconPath(out IntPtr iconPath);
+
+        [PreserveSig]
+        int SetIconPath([MarshalAs(UnmanagedType.LPWStr)] string iconPath, ref Guid eventContext);
+
+        [PreserveSig]
+        int GetGroupingParam(out Guid groupingParam);
+
+        [PreserveSig]
+        int SetGroupingParam(ref Guid groupingParam, ref Guid eventContext);
+
+        [PreserveSig]
+        int RegisterAudioSessionNotification(IntPtr newNotifications);
+
+        [PreserveSig]
+        int UnregisterAudioSessionNotification(IntPtr newNotifications);
+    }
+
+    [ComImport]
+    [Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioSessionControl2
+    {
+        // IAudioSessionControl methods
+        [PreserveSig]
+        int GetState(out int state);
+
+        [PreserveSig]
+        int GetDisplayName(out IntPtr displayName);
+
+        [PreserveSig]
+        int SetDisplayName([MarshalAs(UnmanagedType.LPWStr)] string displayName, ref Guid eventContext);
+
+        [PreserveSig]
+        int GetIconPath(out IntPtr iconPath);
+
+        [PreserveSig]
+        int SetIconPath([MarshalAs(UnmanagedType.LPWStr)] string iconPath, ref Guid eventContext);
+
+        [PreserveSig]
+        int GetGroupingParam(out Guid groupingParam);
+
+        [PreserveSig]
+        int SetGroupingParam(ref Guid groupingParam, ref Guid eventContext);
+
+        [PreserveSig]
+        int RegisterAudioSessionNotification(IntPtr newNotifications);
+
+        [PreserveSig]
+        int UnregisterAudioSessionNotification(IntPtr newNotifications);
+
+        // IAudioSessionControl2 methods
+        [PreserveSig]
+        int GetSessionIdentifier(out IntPtr sessionIdentifier);
+
+        [PreserveSig]
+        int GetSessionInstanceIdentifier(out IntPtr sessionInstanceIdentifier);
+
+        [PreserveSig]
+        int GetProcessId(out uint processId);
+
+        [PreserveSig]
+        int IsSystemSoundsSession();
+
+        [PreserveSig]
+        int SetDuckingPreference([MarshalAs(UnmanagedType.Bool)] bool optOut);
     }
 
     [ComImport]

@@ -10,16 +10,17 @@
   #define Version "0.0.0-dev"
 #endif
 #ifndef ServiceDir
-  #define ServiceDir "..\out\service"
+  #define ServiceDir "out\service"
 #endif
 #ifndef AgentDir
-  #define AgentDir "..\out\agent"
+  #define AgentDir "out\agent"
 #endif
 #ifndef CliDir
-  #define CliDir "..\out\cli"
+  #define CliDir "out\cli"
 #endif
 
 [Setup]
+AppId={{8F3A9C2E-5B71-4D0A-9E64-2C7B1A5D3F90}
 AppName=Activity Tracker
 AppVersion={#Version}
 AppPublisher=Activity Tracker Project
@@ -29,6 +30,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 Compression=lzma2
 SolidCompression=yes
+SourceDir=..
 OutputDir=installer\output
 OutputBaseFilename=ActivityTracker-Setup-{#Version}
 ChangesEnvironment=yes
@@ -41,6 +43,9 @@ DisableWelcomePage=no
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+FinishedLabel=Setup has finished installing [name] on your computer.%n%nNext steps:%n1) open chrome://extensions or brave://extensions or edge://extensions%n2) turn on Developer mode%n3) Load unpacked and choose {app}\extension-<your browser>%n4) open a NEW terminal and run: tracker live
+
 [Files]
 ; Service
 Source: "{#ServiceDir}\*"; DestDir: "{app}\service"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -48,11 +53,17 @@ Source: "{#ServiceDir}\*"; DestDir: "{app}\service"; Flags: ignoreversion recurs
 Source: "{#AgentDir}\*"; DestDir: "{app}\agent"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; CLI
 Source: "{#CliDir}\*"; DestDir: "{app}\cli"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "installer\tracker.cmd"; DestDir: "{app}\cli"; Flags: ignoreversion
 ; Installer scripts
 Source: "installer\scripts\install.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "installer\scripts\uninstall.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
-; Extension
-Source: "Extension\*"; DestDir: "{app}\extension"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Browser Extensions (pre-configured per browser)
+Source: "Extension\*"; DestDir: "{app}\extension-brave"; Excludes: "config.js"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "installer\ext-config\brave\config.js"; DestDir: "{app}\extension-brave"; Flags: ignoreversion
+Source: "Extension\*"; DestDir: "{app}\extension-chrome"; Excludes: "config.js"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "installer\ext-config\chrome\config.js"; DestDir: "{app}\extension-chrome"; Flags: ignoreversion
+Source: "Extension\*"; DestDir: "{app}\extension-edge"; Excludes: "config.js"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "installer\ext-config\edge\config.js"; DestDir: "{app}\extension-edge"; Flags: ignoreversion
 ; Docs
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -64,25 +75,18 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
     Check: NeedsAddPath('{app}\cli')
 
 [Run]
-; Generate tracker.cmd wrapper
-Filename: "cmd.exe"; Parameters: "/c echo @""%~dp0ActivityTracker.Cli.exe"" %* > ""{app}\cli\tracker.cmd"""; \
-    Flags: runhidden; StatusMsg: "Creating tracker command wrapper..."
-
-[UninstallRun]
-Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\uninstall.ps1"""; \
-    Flags: runhidden; RunOnceId: "UninstallCleanup"; StatusMsg: "Removing service and scheduled task..."
+Filename: "{win}\explorer.exe"; Parameters: """{app}"""; Description: "Open the browser extension folders"; Flags: postinstall skipifsilent unchecked
+Filename: "{app}\README.md"; Description: "View README"; Flags: postinstall shellexec skipifsilent unchecked
 
 [Code]
 var
   ConsentPage: TWizardPage;
   ConsentCheckbox: TNewCheckBox;
-  ConsentLabel: TNewStaticText;
 
 // ─── PATH helper: only add to PATH if not already present ───
 function NeedsAddPath(Param: string): Boolean;
 var
-  OrigPath: string;
+  OrigPath, ExpandedParam: string;
 begin
   if not RegQueryStringValue(HKLM,
     'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
@@ -91,7 +95,8 @@ begin
     Result := True;
     exit;
   end;
-  Result := Pos(';' + UpperCase(Param) + ';', ';' + UpperCase(OrigPath) + ';') = 0;
+  ExpandedParam := ExpandConstant(Param);
+  Result := Pos(';' + UpperCase(ExpandedParam) + ';', ';' + UpperCase(OrigPath) + ';') = 0;
 end;
 
 // ─── Remove from PATH on uninstall ───
@@ -145,19 +150,15 @@ begin
   Memo.AutoSize := False;
   Memo.WordWrap := True;
   Memo.Caption :=
-    'Activity Tracker is a privacy-first, local-only tool that records:' + #13#10 +
-    #13#10 +
+    'Activity Tracker is a privacy-first, local-only tool that records:' + #13#10 + #13#10 +
     '  - Active window titles and application names' + #13#10 +
     '  - Browser tab domains (not full URLs or page content)' + #13#10 +
     '  - Audio/media playback state (which domain is playing)' + #13#10 +
-    '  - Lock screen and idle periods' + #13#10 +
-    #13#10 +
+    '  - Lock screen and idle periods' + #13#10 + #13#10 +
     'All data stays on THIS computer in an encrypted database.' + #13#10 +
-    'Nothing is sent to the internet. There is no cloud, no telemetry.' + #13#10 +
-    #13#10 +
+    'Nothing is sent to the internet. There is no cloud, no telemetry.' + #13#10 + #13#10 +
     'This tool is designed for the person who owns and uses this PC' + #13#10 +
-    'to review their own activity. It is not a surveillance tool.' + #13#10 +
-    #13#10 +
+    'to review their own activity. It is not a surveillance tool.' + #13#10 + #13#10 +
     'IMPORTANT: Run this installer as the user whose activity will' + #13#10 +
     'be tracked and approve the administrator prompt. Do not sign' + #13#10 +
     'in as a different admin account.';
@@ -255,14 +256,17 @@ begin
 end;
 
 // ─── Finished page customization ───
-procedure UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
-  MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String);
+procedure CurPageChanged(CurPageID: Integer);
 begin
-  // Default behavior
-end;
-
-function UpdateReadyMemoText(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
-  MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
-begin
-  Result := '';
+  if CurPageID = wpFinished then
+  begin
+    WizardForm.FinishedLabel.Height := ScaleY(115);
+    WizardForm.FinishedLabel.Caption :=
+      'Setup has finished installing Activity Tracker on your computer.' + #13#10 + #13#10 +
+      'Next steps:' + #13#10 +
+      '1) open chrome://extensions or brave://extensions or edge://extensions' + #13#10 +
+      '2) turn on Developer mode' + #13#10 +
+      '3) Load unpacked and choose ' + ExpandConstant('{app}') + '\extension-<your browser>' + #13#10 +
+      '4) open a NEW terminal and run: tracker live';
+  end;
 end;

@@ -14,4 +14,5 @@ obj/
 config.json
 *.log
 logs/
-
+installer/output/
+out/

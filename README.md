@@ -27,6 +27,51 @@ The SQLite database is encrypted with SQLCipher using a key protected by Windows
 > [!NOTE]
 > Because `LocalMachine` scope is used to allow the Session 0 background service to access the database across system restarts and user sessions, any process running locally on the machine with appropriate local permissions can invoke DPAPI to decrypt the key. The encryption is designed to protect your sensitive activity history against **offline disk theft** (e.g., extracting the drive or copying files from an unbooted machine). It does not protect against malware or untrusted applications already executing locally on your system.
 
+---
+
+## Quick Install
+
+If you want to install Activity Tracker on your PC without building from source:
+
+1. **Download:** Get `ActivityTracker-Setup-<version>.exe` from the latest [Releases](https://github.com/BhavanathJ/activity_tracker/releases).
+2. **SmartScreen Prompt:** When prompted by Windows SmartScreen ("Windows protected your PC"), click **More info** and then click **Run anyway**.
+3. **Verify Checksum (optional):**
+   ```powershell
+   Get-FileHash ActivityTracker-Setup-*.exe -Algorithm SHA256
+   ```
+   Compare the hash output against `checksums.txt` in the release.
+4. **Install:** Run the installer as your normal user account and approve administrator elevation when requested. Read and accept the privacy confirmation.
+5. **Load Browser Extension:**
+   - Open your browser's extensions page (`chrome://extensions`, `brave://extensions`, or `edge://extensions`).
+   - Enable **Developer mode** (toggle in the top-right corner).
+   - Click **Load unpacked** and select the extension folder for your browser located in your installation directory (e.g. `C:\Program Files\ActivityTracker\extension-chrome`, `extension-brave`, or `extension-edge`).
+6. **Verify:** Open a **NEW terminal** (PowerShell or Command Prompt) and run:
+   ```cmd
+   tracker live
+   ```
+   You will see the live activity monitoring dashboard updating in real time.
+
+---
+
+## Responsible Use
+
+Activity Tracker is built from the ground up for personal productivity awareness and self-reflection:
+
+- **Own PC Only:** Activity Tracker is designed strictly for use on your own personal computer by the person who owns and operates the machine.
+- **Local-Only & Zero Cloud:** All data is stored locally in an encrypted SQLCipher SQLite database protected by Windows DPAPI. Zero data leaves your computer. There is no telemetry, no tracking, and no cloud service.
+- **What Is Recorded:**
+  - Active foreground window titles and application process names.
+  - Web browser tab domains (e.g. `github.com`) and background media audio state. Full URLs, URL query parameters, page contents, keystrokes, and form inputs are **never** recorded.
+  - User session states (lock screen, unlock, logon, logoff) and system idle periods.
+- **Surveillance Prohibition:** **Do not install this software on any device you do not own or without the explicit knowledge and informed consent of the user.** It is not a covert surveillance or spyware tool.
+- **Uninstallation & Data Deletion:**
+  - To uninstall, go to Windows Settings > **Installed apps** > **Activity Tracker** > **Uninstall** (or run `unins000.exe` in the install directory).
+  - The uninstaller will prompt: *"Also delete your recorded activity data?"*. Choosing **Yes** permanently removes `%PROGRAMDATA%\ActivityTracker` and all recorded database history. Choosing **No** (the default) removes the service, agent, and binaries while preserving your database for future use.
+  - You may also delete `%PROGRAMDATA%\ActivityTracker` manually at any time after uninstallation.
+
+---
+
+
 ## Configuration
 
 The service and agent read configuration from `%PROGRAMDATA%\ActivityTracker\config.json`. If the file doesn't exist, it will be generated on first run with the real defaults:
