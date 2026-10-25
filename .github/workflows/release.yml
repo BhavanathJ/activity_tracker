@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.1.7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4.0.1
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Extract version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag -replace '^v', ''
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "Version: $ver"
+
+      - name: Publish Service
+        shell: pwsh
+        run: >
+          dotnet publish ActivityTracker.Service/ActivityTracker.Service.csproj
+          -c Release -r win-x64 --self-contained true
+          -o out/service
+
+      - name: Publish SessionAgent
+        shell: pwsh
+        run: >
+          dotnet publish ActivityTracker.SessionAgent/ActivityTracker.SessionAgent.csproj
+          -c Release -r win-x64 --self-contained true
+          -o out/agent
+
+      - name: Publish CLI
+        shell: pwsh
+        run: >
+          dotnet publish ActivityTracker.Cli/ActivityTracker.Cli.csproj
+          -c Release -r win-x64 --self-contained true
+          -o out/cli
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: >
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          /DVersion=${{ steps.version.outputs.VERSION }}
+          /DServiceDir=out\service
+          /DAgentDir=out\agent
+          /DCliDir=out\cli
+          installer\ActivityTracker.iss
+
+      - name: Create Extension zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path Extension\* -DestinationPath installer\output\ActivityTracker-Extension-${{ steps.version.outputs.VERSION }}.zip
+
+      - name: Compute checksums
+        shell: pwsh
+        run: |
+          $setupExe = "installer\output\ActivityTracker-Setup-${{ steps.version.outputs.VERSION }}.exe"
+          $extZip   = "installer\output\ActivityTracker-Extension-${{ steps.version.outputs.VERSION }}.zip"
+
+          $lines = @()
+          foreach ($file in @($setupExe, $extZip)) {
+            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash
+            $name = Split-Path $file -Leaf
+            $lines += "$hash  $name"
+          }
+          $lines | Set-Content "installer\output\checksums.txt"
+          Get-Content "installer\output\checksums.txt"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2.0.8
+        with:
+          name: Activity Tracker v${{ steps.version.outputs.VERSION }}
+          body: |
+            ## Activity Tracker v${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            1. Download `ActivityTracker-Setup-${{ steps.version.outputs.VERSION }}.exe` below.
+            2. Run it and follow the installer prompts.
+            3. After install, load the browser extension from the `extension` folder (see README).
+            4. Open a new terminal and run `tracker live` to verify.
+
+            ### Verify download
+            Compare the SHA-256 hash of your downloaded file against `checksums.txt`.
+          files: |
+            installer/output/ActivityTracker-Setup-${{ steps.version.outputs.VERSION }}.exe
+            installer/output/ActivityTracker-Extension-${{ steps.version.outputs.VERSION }}.zip
+            installer/output/checksums.txt
