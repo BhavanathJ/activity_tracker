@@ -138,9 +138,9 @@ The live dashboard shows current state (ACTIVE / LOCKED / IDLE), the focused win
 
 If output is piped or redirected, a single snapshot is printed and the command exits immediately.
 
-**PowerShell alias (optional):**
+**PowerShell alias (optional)** *(adjust the path to where you built/published the CLI)*:
 ```powershell
-Set-Alias tracker "C:\ProgramData\ActivityTracker\ActivityTracker.Cli.exe"
+Set-Alias tracker "C:\My Files\Project\Activity Tracker\ActivityTracker.Cli\bin\Release\net8.0-windows\win-x64\publish\ActivityTracker.Cli.exe"
 tracker live
 tracker report --today
 ```

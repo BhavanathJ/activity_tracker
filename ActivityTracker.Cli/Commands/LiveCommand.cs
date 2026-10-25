@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using Microsoft.Data.Sqlite;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 using Spectre.Console.Cli;
 using ActivityTracker.Core.Data;
 
@@ -38,7 +39,7 @@ public class LiveCommand : Command<LiveCommand.Settings>
         if (Console.IsOutputRedirected || !AnsiConsole.Profile.Capabilities.Interactive)
         {
             var table = BuildLiveTable(dbManager, settings.Interval, out _);
-            AnsiConsole.Write(table);
+            AnsiConsole.Write(table ?? new Table().AddColumn("info").AddRow("Waiting for database..."));
             return 0;
         }
 
@@ -50,41 +51,51 @@ public class LiveCommand : Command<LiveCommand.Settings>
             cts.Cancel();
         };
 
-        try
-        {
-            AnsiConsole.Live(new Text("Loading..."))
-                .AutoClear(false)
-                .Overflow(VerticalOverflow.Ellipsis)
-                .Start(ctx =>
-                {
-                    while (!cts.Token.IsCancellationRequested)
-                    {
-                        var table = BuildLiveTable(dbManager, settings.Interval, out var dbError);
-                        ctx.UpdateTarget(table);
-                        ctx.Refresh();
+        Table? lastGoodSnapshot = null;
 
-                        try
-                        {
-                            Task.Delay(settings.Interval * 1000, cts.Token).Wait(cts.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            break;
-                        }
+        AnsiConsole.Live(new Text("Loading..."))
+            .AutoClear(false)
+            .Overflow(VerticalOverflow.Ellipsis)
+            .Start(ctx =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    var table = BuildLiveTable(dbManager, settings.Interval, out var dbError);
+
+                    if (table != null)
+                    {
+                        lastGoodSnapshot = table;
+                        ctx.UpdateTarget(table);
                     }
-                });
-        }
-        catch (OperationCanceledException)
-        {
-            // Clean exit
-        }
+                    else if (lastGoodSnapshot != null)
+                    {
+                        // Re-render last good snapshot with error footer appended
+                        var fallback = CloneWithErrorFooter(lastGoodSnapshot, dbError!);
+                        ctx.UpdateTarget(fallback);
+                    }
+                    else
+                    {
+                        // No successful snapshot yet
+                        ctx.UpdateTarget(new Markup("[yellow]Waiting for database...[/]"));
+                    }
+
+                    ctx.Refresh();
+
+                    if (cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(settings.Interval)))
+                        break;
+                }
+            });
 
         // Restore cursor visibility on exit
         AnsiConsole.Cursor.Show();
         return 0;
     }
 
-    private static Table BuildLiveTable(DatabaseManager dbManager, int interval, out string? dbError)
+    /// <summary>
+    /// Returns null if a SqliteException prevents reading data.
+    /// On success, dbError is null. On failure, dbError contains the message for the footer.
+    /// </summary>
+    private static Table? BuildLiveTable(DatabaseManager dbManager, int interval, out string? dbError)
     {
         dbError = null;
         var nowUtc = DateTimeOffset.UtcNow;
@@ -281,10 +292,12 @@ public class LiveCommand : Command<LiveCommand.Settings>
         catch (SqliteException ex) when (IsSqliteBusy(ex))
         {
             dbError = "DB busy, retrying...";
+            return null;
         }
         catch (SqliteException ex)
         {
-            dbError = $"DB busy, retrying... ({ex.SqliteErrorCode})";
+            dbError = $"DB error ({ex.SqliteErrorCode}), retrying...";
+            return null;
         }
 
         // Derive state
@@ -538,6 +551,19 @@ public class LiveCommand : Command<LiveCommand.Settings>
         root.AddRow(new Markup(string.Join("  ", footerParts)));
 
         return root;
+    }
+
+    /// <summary>
+    /// Creates a simple renderable that shows the last good snapshot info plus an error footer.
+    /// We cannot deep-clone a Spectre Table, so we wrap the error in a new single-row table.
+    /// </summary>
+    private static IRenderable CloneWithErrorFooter(Table lastGood, string errorMessage)
+    {
+        // Re-render the last good table as-is by wrapping in a Rows composite
+        // with the error appended underneath.
+        return new Rows(
+            lastGood,
+            new Markup($"[bold yellow]{Markup.Escape(errorMessage)}[/]"));
     }
 
     private static string FormatElapsed(long seconds)
