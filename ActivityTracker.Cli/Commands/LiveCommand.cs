@@ -340,10 +340,45 @@ public class LiveCommand : Command<LiveCommand.Settings>
         Dictionary<string, long> audioTotals, long lockedTotal,
         List<EventRow> recentEvents, string? dbError)
     {
+        // ── Dynamic width computation ──
+        // Recompute every refresh so terminal resizing is reflected.
+        var consoleWidth = AnsiConsole.Profile.Width;
+
+        // Root table: Heavy border uses 2 chars each side + 1 padding each side = 6 total
+        var rootInner = consoleWidth - 6;
+        if (rootInner < 40) rootInner = 40;
+
+        // "Today So Far" panel: Rounded border (2+1 each side = 6) for todayPanel,
+        // then 3 sub-columns with Simple borders and separators.
+        // todayPanel outer border: 6 chars. Column separators: 2 * 2 = 4 (pipe + space each side for 2 dividers).
+        // Each sub-panel available = (rootInner - 6 - 4) / 3
+        // Inside each sub-panel: Simple border takes ~4 chars, padding ~2 chars = 6.
+        // Sub-panel has 2 columns: name + time. Time text is max 9 chars (e.g. "2h 53m" or "59m 59s").
+        // Time column width = 9. Separator between columns in sub-panel = 2.
+        // nameWidth = subPanelInner - timeColWidth - separator
+        const int TimeColWidth = 9;
+        var subPanelTotal = (rootInner - 6 - 4) / 3;   // available per sub-panel cell
+        var subPanelInner = subPanelTotal - 6;          // minus Simple border + padding
+        if (subPanelInner < TimeColWidth + 4) subPanelInner = TimeColWidth + 4;
+        var nameWidth = subPanelInner - TimeColWidth - 2; // minus separator between columns
+        if (nameWidth < 8) nameWidth = 8;
+
+        // "Now" panel: Rounded border (6 chars). 4 columns: Type(10), App/Domain, Title, For(10).
+        // Separators between columns: 3 * 2 = 6. Fixed columns take 10+10 = 20.
+        // Remaining = rootInner - 6 - 6 - 20 = rootInner - 32, split between App/Domain and Title.
+        var nowRemaining = rootInner - 32;
+        if (nowRemaining < 20) nowRemaining = 20;
+        var nowAppWidth = Math.Max(8, nowRemaining * 2 / 5);
+        var nowTitleWidth = Math.Max(8, nowRemaining - nowAppWidth);
+
+        // "Recent Events" table: Rounded border (6). 4 columns: Type(8), Start(10), Duration(10), App/Domain.
+        // Separators: 6. Fixed = 8+10+10 = 28.
+        var recentAppWidth = Math.Max(8, rootInner - 6 - 6 - 28);
+
         var root = new Table()
             .Border(TableBorder.Heavy)
             .BorderColor(Color.Grey35)
-            .Width(110)
+            .Width(consoleWidth)
             .HideHeaders()
             .AddColumn(new TableColumn("content").NoWrap());
 
@@ -362,10 +397,10 @@ public class LiveCommand : Command<LiveCommand.Settings>
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Grey50)
             .Title("[bold cyan]Now[/]")
-            .AddColumn(new TableColumn("[bold]Type[/]").Width(10))
-            .AddColumn(new TableColumn("[bold]App / Domain[/]").Width(30))
-            .AddColumn(new TableColumn("[bold]Title[/]").Width(45))
-            .AddColumn(new TableColumn("[bold]For[/]").Width(10).RightAligned());
+            .AddColumn(new TableColumn("[bold]Type[/]").Width(10).NoWrap())
+            .AddColumn(new TableColumn("[bold]App / Domain[/]").Width(nowAppWidth).NoWrap())
+            .AddColumn(new TableColumn("[bold]Title[/]").Width(nowTitleWidth).NoWrap())
+            .AddColumn(new TableColumn("[bold]For[/]").Width(10).RightAligned().NoWrap());
 
         // Current window
         if (openWindows.Count > 0)
@@ -374,8 +409,8 @@ public class LiveCommand : Command<LiveCommand.Settings>
             var dur = FormatElapsed(nowUnix - w.StartTime);
             nowPanel.AddRow(
                 "[cyan]window[/]",
-                $"[cyan]{Markup.Escape(w.ProcessOrDomain)}[/]",
-                Markup.Escape(Truncate(w.Title, 44)),
+                $"[cyan]{Markup.Escape(Truncate(w.ProcessOrDomain, nowAppWidth))}[/]",
+                Markup.Escape(Truncate(w.Title, nowTitleWidth)),
                 $"[dim]{dur}[/]");
         }
         else
@@ -392,8 +427,8 @@ public class LiveCommand : Command<LiveCommand.Settings>
                 var browserLabel = b.Browser != null ? $" [dim]({Markup.Escape(b.Browser)})[/]" : "";
                 nowPanel.AddRow(
                     "[green]browser[/]",
-                    $"[green]{Markup.Escape(b.ProcessOrDomain)}[/]{browserLabel}",
-                    Markup.Escape(Truncate(b.Title, 44)),
+                    $"[green]{Markup.Escape(Truncate(b.ProcessOrDomain, nowAppWidth))}[/]{browserLabel}",
+                    Markup.Escape(Truncate(b.Title, nowTitleWidth)),
                     $"[dim]{dur}[/]");
             }
         }
@@ -408,10 +443,21 @@ public class LiveCommand : Command<LiveCommand.Settings>
             foreach (var a in openAudios)
             {
                 var dur = FormatElapsed(nowUnix - a.StartTime);
-                var browserLabel = a.Browser != null ? $" ({Markup.Escape(a.Browser)})" : "";
+                string audioLabel;
+                if (a.Browser != null)
+                {
+                    var suffix = $" ({a.Browser})";
+                    var domainMax = nowAppWidth - suffix.Length;
+                    var truncatedDomain = Truncate(a.ProcessOrDomain, Math.Max(8, domainMax));
+                    audioLabel = $"[yellow]{Markup.Escape(truncatedDomain)}[/][dim] ({Markup.Escape(a.Browser)})[/]";
+                }
+                else
+                {
+                    audioLabel = $"[yellow]{Markup.Escape(Truncate(a.ProcessOrDomain, nowAppWidth))}[/]";
+                }
                 nowPanel.AddRow(
                     "[yellow]audio[/]",
-                    $"[yellow]{Markup.Escape(a.ProcessOrDomain)}[/][dim]{browserLabel}[/]",
+                    audioLabel,
                     "[dim]-[/]",
                     $"[dim]{dur}[/]");
             }
@@ -429,22 +475,22 @@ public class LiveCommand : Command<LiveCommand.Settings>
             .BorderColor(Color.Grey50)
             .Title("[bold white]Today So Far[/]")
             .HideHeaders()
-            .AddColumn(new TableColumn("c1").Width(36))
-            .AddColumn(new TableColumn("c2").Width(36))
-            .AddColumn(new TableColumn("c3").Width(36));
+            .AddColumn(new TableColumn("c1").Width(subPanelTotal).NoWrap())
+            .AddColumn(new TableColumn("c2").Width(subPanelTotal).NoWrap())
+            .AddColumn(new TableColumn("c3").Width(subPanelTotal).NoWrap());
 
         // Top 5 Apps
         var appsTable = new Table()
             .Border(TableBorder.Simple)
             .Title("[bold cyan]Apps (window)[/]")
-            .AddColumn(new TableColumn("[bold]App[/]").Width(22))
-            .AddColumn(new TableColumn("[bold]Time[/]").Width(10).RightAligned());
+            .AddColumn(new TableColumn("[bold]App[/]").Width(nameWidth).NoWrap())
+            .AddColumn(new TableColumn("[bold]Time[/]").Width(TimeColWidth).RightAligned().NoWrap());
 
         var topApps = appTotals.OrderByDescending(kv => kv.Value).Take(5);
         foreach (var kv in topApps)
         {
             appsTable.AddRow(
-                $"[cyan]{Markup.Escape(Truncate(kv.Key, 21))}[/]",
+                $"[cyan]{Markup.Escape(Truncate(kv.Key, nameWidth))}[/]",
                 $"[cyan]{FormatDuration(kv.Value)}[/]");
         }
         if (!appTotals.Any()) appsTable.AddRow("[dim]-[/]", "[dim]-[/]");
@@ -453,14 +499,14 @@ public class LiveCommand : Command<LiveCommand.Settings>
         var domainsTable = new Table()
             .Border(TableBorder.Simple)
             .Title("[bold green]Domains (browser)[/]")
-            .AddColumn(new TableColumn("[bold]Domain[/]").Width(22))
-            .AddColumn(new TableColumn("[bold]Time[/]").Width(10).RightAligned());
+            .AddColumn(new TableColumn("[bold]Domain[/]").Width(nameWidth).NoWrap())
+            .AddColumn(new TableColumn("[bold]Time[/]").Width(TimeColWidth).RightAligned().NoWrap());
 
         var topDomains = domainTotals.OrderByDescending(kv => kv.Value).Take(5);
         foreach (var kv in topDomains)
         {
             domainsTable.AddRow(
-                $"[green]{Markup.Escape(Truncate(kv.Key, 21))}[/]",
+                $"[green]{Markup.Escape(Truncate(kv.Key, nameWidth))}[/]",
                 $"[green]{FormatDuration(kv.Value)}[/]");
         }
         if (!domainTotals.Any()) domainsTable.AddRow("[dim]-[/]", "[dim]-[/]");
@@ -469,14 +515,15 @@ public class LiveCommand : Command<LiveCommand.Settings>
         var audioTable = new Table()
             .Border(TableBorder.Simple)
             .Title("[bold yellow]Audio[/]")
-            .AddColumn(new TableColumn("[bold]Source[/]").Width(22))
-            .AddColumn(new TableColumn("[bold]Time[/]").Width(10).RightAligned());
+            .AddColumn(new TableColumn("[bold]Source[/]").Width(nameWidth).NoWrap())
+            .AddColumn(new TableColumn("[bold]Time[/]").Width(TimeColWidth).RightAligned().NoWrap());
 
         var topAudio = audioTotals.OrderByDescending(kv => kv.Value).Take(5);
         foreach (var kv in topAudio)
         {
+            // audioTotals keys are already "domain (browser)" or plain domain
             audioTable.AddRow(
-                $"[yellow]{Markup.Escape(Truncate(kv.Key, 21))}[/]",
+                $"[yellow]{TruncateAudioKey(kv.Key, nameWidth)}[/]",
                 $"[yellow]{FormatDuration(kv.Value)}[/]");
         }
         if (!audioTotals.Any()) audioTable.AddRow("[dim]-[/]", "[dim]-[/]");
@@ -495,10 +542,10 @@ public class LiveCommand : Command<LiveCommand.Settings>
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Grey50)
             .Title("[bold white]Recent Events[/]")
-            .AddColumn(new TableColumn("[bold]Type[/]").Width(8))
-            .AddColumn(new TableColumn("[bold]Start[/]").Width(10))
-            .AddColumn(new TableColumn("[bold]Duration[/]").Width(10).RightAligned())
-            .AddColumn(new TableColumn("[bold]App / Domain[/]").Width(30));
+            .AddColumn(new TableColumn("[bold]Type[/]").Width(8).NoWrap())
+            .AddColumn(new TableColumn("[bold]Start[/]").Width(10).NoWrap())
+            .AddColumn(new TableColumn("[bold]Duration[/]").Width(10).RightAligned().NoWrap())
+            .AddColumn(new TableColumn("[bold]App / Domain[/]").Width(recentAppWidth).NoWrap());
 
         foreach (var ev in recentEvents)
         {
@@ -522,10 +569,18 @@ public class LiveCommand : Command<LiveCommand.Settings>
                 _ => "white"
             };
 
-            var appDomain = Markup.Escape(Truncate(ev.ProcessOrDomain, 29));
+            string appDomain;
             if (ev.Browser != null)
             {
-                appDomain += $" [dim]({Markup.Escape(ev.Browser)})[/]";
+                // Truncate domain but keep " (browser)" suffix intact
+                var suffix = $" ({ev.Browser})";
+                var domainMax = recentAppWidth - suffix.Length;
+                var truncatedDomain = Truncate(ev.ProcessOrDomain, Math.Max(8, domainMax));
+                appDomain = $"{Markup.Escape(truncatedDomain)} [dim]({Markup.Escape(ev.Browser)})[/]";
+            }
+            else
+            {
+                appDomain = Markup.Escape(Truncate(ev.ProcessOrDomain, recentAppWidth));
             }
 
             recentTable.AddRow(
@@ -583,10 +638,38 @@ public class LiveCommand : Command<LiveCommand.Settings>
         return $"{ts.Minutes}m {ts.Seconds}s";
     }
 
-    private static string Truncate(string value, int maxLength)
+    /// <summary>
+    /// Returns text unchanged if it fits in maxWidth; otherwise returns the first
+    /// (maxWidth - 1) characters followed by "…". Handles null/empty and maxWidth &lt; 2 safely.
+    /// </summary>
+    private static string Truncate(string? text, int maxWidth)
     {
-        if (string.IsNullOrEmpty(value)) return value;
-        return value.Length <= maxLength ? value : value[..(maxLength - 1)] + "…";
+        if (string.IsNullOrEmpty(text)) return text ?? string.Empty;
+        if (maxWidth < 2) return "…";
+        return text.Length <= maxWidth ? text : text[..(maxWidth - 1)] + "…";
+    }
+
+
+
+    /// <summary>
+    /// For audio total keys that are already formatted as "domain (browser)" or plain domain.
+    /// Parses out the suffix, truncates only the domain part, then reassembles.
+    /// Returns markup-safe text (already escaped).
+    /// </summary>
+    private static string TruncateAudioKey(string key, int maxWidth)
+    {
+        // Keys from audioTotals are either "domain (browser)" or just "domain"
+        var lastOpen = key.LastIndexOf(" (");
+        if (lastOpen > 0 && key.EndsWith(")"))
+        {
+            var domain = key[..lastOpen];
+            var suffix = key[lastOpen..]; // e.g. " (brave)"
+            var domainMax = maxWidth - suffix.Length;
+            var truncatedDomain = Truncate(domain, Math.Max(8, domainMax));
+            return $"{Markup.Escape(truncatedDomain)}{Markup.Escape(suffix)}";
+        }
+
+        return Markup.Escape(Truncate(key, maxWidth));
     }
 
     private static bool IsSqliteBusy(SqliteException ex)
