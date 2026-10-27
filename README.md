@@ -12,6 +12,7 @@ A private, local-only activity tracker for Windows. It records which app and bro
 ---
 
 ## Contents
+- [Before you install](#before-you-install)
 - [Quick install](#quick-install)
 - [What it records](#what-it-records)
 - [Using it](#using-it)
@@ -22,6 +23,20 @@ A private, local-only activity tracker for Windows. It records which app and bro
 - [Troubleshooting](#troubleshooting)
 - [Build from source](#build-from-source)
 - [Responsible use](#responsible-use)
+
+---
+
+## Before you install
+
+You need:
+- **Windows 10 (version 2004 or newer) or Windows 11**, 64-bit Intel/AMD (`x64`). Not supported: Windows 7/8, 32-bit Windows, ARM PCs.
+- **Administrator rights** on the PC. The installer registers a background service and asks for approval once.
+- **Chrome, Brave or Edge** if you want website tracking. Window tracking works without them. Firefox is not supported.
+- A few hundred MB of free disk space.
+- **Port 14321** free on localhost (the tracker uses it internally).
+- The **Microsoft Visual C++ Redistributable (x64)**. Most PCs already have it. If the service fails to start after install, install it from Microsoft and run the installer again. *(This is a precaution: it has not been tested on a PC without it.)*
+
+You do **not** need to install .NET or any developer tools.
 
 ---
 
