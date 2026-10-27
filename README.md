@@ -1,80 +1,173 @@
 # Activity Tracker
 
-A privacy-first, offline Windows activity tracker built in C#/.NET 8. It uses Win32 APIs for tracking window focus and system events, stores data in a DPAPI-protected SQLCipher SQLite database, and provides a CLI for local reporting.
+A private, local-only activity tracker for Windows. It records which app and browser site you are using, whether media is playing, and when you are away, then lets you see it all from a command-line dashboard and reports.
 
-## Architecture
+- **Local only.** No cloud, no telemetry, no network calls except to `127.0.0.1` on your own PC.
+- **Encrypted at rest.** The database is SQLCipher-encrypted; its key is protected by Windows DPAPI.
+- **Starts with Windows.** A background service plus a small per-user agent.
+- **Visible, not hidden.** It shows up in Installed apps, Services and Task Scheduler, and the installer asks for consent.
 
-Because Windows isolates services in Session 0 (non-interactive), Activity Tracker is split into a multi-process architecture to securely and effectively track user activity:
-
-1. **ActivityTracker.Service:** A Native AOT background Windows Service. It owns the SQLite database, handles data retention, and hosts a local HTTP listener on port 14321.
-2. **ActivityTracker.SessionAgent:** A lightweight user-session process that runs via Task Scheduler "At log on." It monitors window focus changes, media playback state (via WinRT GSMTC), and system idle state using Win32 hooks, sending events to the Service via HTTP.
-3. **Browser Extension:** A Manifest V3 extension that tracks active tabs and audible background media for Chromium-based browsers (Chrome, Brave, Edge), reporting back to the Service via HTTP.
-4. **ActivityTracker.Cli:** A Spectre.Console-powered CLI tool for querying the encrypted database and generating activity reports.
-
-## Features
-- **Window Focus Tracking:** Monitors active application and window titles.
-- **Browser & Audio Tracking:** Tracks domain focus and background audio for Chrome, Brave, and Edge.
-- **Media-Aware Idle Detection:** Idle is suppressed when (a) the foreground app has a GSMTC session Playing, (b) the focused browser's active tab is audible, or (c) the foreground window is fullscreen AND audio output peak > 0.001. There is no maximum duration: media keeps the user active for as long as it plays.
-- **Encrypted Local Storage:** Zero cloud calls. Data is protected at rest with a DPAPI-encrypted SQLCipher database key.
-- **Configurable Rules:** Include or exclude specific applications or domains via a JSON configuration file.
-- **Retention & Rollups:** Automatically summarizes data older than 90 days into monthly rollups.
-- **Reporting:** Color-coded `tracker report` CLI with timeline, daily, weekly, and monthly reports, plus data quality diagnostics.
-
-## Threat Model & Encryption
-
-The SQLite database is encrypted with SQLCipher using a key protected by Windows DPAPI (`DataProtectionScope.LocalMachine`).
-
-> [!NOTE]
-> Because `LocalMachine` scope is used to allow the Session 0 background service to access the database across system restarts and user sessions, any process running locally on the machine with appropriate local permissions can invoke DPAPI to decrypt the key. The encryption is designed to protect your sensitive activity history against **offline disk theft** (e.g., extracting the drive or copying files from an unbooted machine). It does not protect against malware or untrusted applications already executing locally on your system.
+> **Status: early release (v0.x).** Tested on **Windows 11 Home, x64** only. Windows 10 (2004+) and other setups are expected to work but are untested. Bug reports are welcome (see [Reporting problems](#reporting-problems)).
 
 ---
 
-## Quick Install
+## Contents
+- [Quick install](#quick-install)
+- [What it records](#what-it-records)
+- [Using it](#using-it)
+- [Requirements and limits](#requirements-and-limits)
+- [Uninstall](#uninstall)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Troubleshooting](#troubleshooting)
+- [Build from source](#build-from-source)
+- [Responsible use](#responsible-use)
 
-If you want to install Activity Tracker on your PC without building from source:
+---
 
-1. **Download:** Get `ActivityTracker-Setup-<version>.exe` from the latest [Releases](https://github.com/BhavanathJ/activity_tracker/releases).
-2. **SmartScreen Prompt:** When prompted by Windows SmartScreen ("Windows protected your PC"), click **More info** and then click **Run anyway**.
-3. **Verify Checksum (optional):**
+## Quick install
+
+1. **Download** `ActivityTracker-Setup-<version>.exe` from the latest [Release](https://github.com/BhavanathJ/activity_tracker/releases).
+2. **Windows SmartScreen** will warn that the app is from an unknown publisher, because the installer is not code-signed. Click **More info**, then **Run anyway**.
+3. *(Optional)* Check the download against `checksums.txt` from the same release:
    ```powershell
-   Get-FileHash ActivityTracker-Setup-*.exe -Algorithm SHA256
+   Get-FileHash .\ActivityTracker-Setup-*.exe -Algorithm SHA256
    ```
-   Compare the hash output against `checksums.txt` in the release.
-4. **Install:** Run the installer as your normal user account and approve administrator elevation when requested. Read and accept the privacy confirmation.
-5. **Load Browser Extension:**
-   - Open your browser's extensions page (`chrome://extensions`, `brave://extensions`, or `edge://extensions`).
-   - Enable **Developer mode** (toggle in the top-right corner).
-   - Click **Load unpacked** and select the extension folder for your browser located in your installation directory (e.g. `C:\Program Files\ActivityTracker\extension-chrome`, `extension-brave`, or `extension-edge`).
-6. **Verify:** Open a **NEW terminal** (PowerShell or Command Prompt) and run:
-   ```cmd
+4. **Run the installer as your normal user account** and approve the administrator prompt. Do not sign in as a different admin account: the tracker records the user who runs the installer. Read and accept the privacy page.
+5. **Load the browser extension** (needed for website tracking; window tracking works without it):
+   1. Open `chrome://extensions`, `brave://extensions` or `edge://extensions`.
+   2. Turn on **Developer mode**.
+   3. Click **Load unpacked** and choose the folder for your browser inside the install folder:
+      - `C:\Program Files\ActivityTracker\extension-chrome`
+      - `C:\Program Files\ActivityTracker\extension-brave`
+      - `C:\Program Files\ActivityTracker\extension-edge`
+   
+   Use only the folder that matches your browser. Repeat for each browser you want tracked.
+6. **Check it works.** Open a **new** terminal (an already-open one will not see the new command) and run:
+   ```
    tracker live
    ```
-   You will see the live activity monitoring dashboard updating in real time.
+
+Chrome and Edge show a "developer mode extensions" notice when they start, because the extension is loaded unpacked. This is expected.
 
 ---
 
-## Responsible Use
+## What it records
 
-Activity Tracker is built from the ground up for personal productivity awareness and self-reflection:
+| Recorded | Not recorded |
+|---|---|
+| Foreground app name and **window title** | Keystrokes, mouse movement, screenshots |
+| Browser **domain** (e.g. `github.com`) of the active tab | Full URLs, query strings, page content, form data |
+| Whether audio or video is playing (and from which app or domain) | The audio or video itself |
+| Lock, unlock, logon, logoff, idle/away periods | Anything about other users on the PC |
 
-- **Own PC Only:** Activity Tracker is designed strictly for use on your own personal computer by the person who owns and operates the machine.
-- **Local-Only & Zero Cloud:** All data is stored locally in an encrypted SQLCipher SQLite database protected by Windows DPAPI. Zero data leaves your computer. There is no telemetry, no tracking, and no cloud service.
-- **What Is Recorded:**
-  - Active foreground window titles and application process names.
-  - Web browser tab domains (e.g. `github.com`) and background media audio state. Full URLs, URL query parameters, page contents, keystrokes, and form inputs are **never** recorded.
-  - User session states (lock screen, unlock, logon, logoff) and system idle periods.
-- **Surveillance Prohibition:** **Do not install this software on any device you do not own or without the explicit knowledge and informed consent of the user.** It is not a covert surveillance or spyware tool.
-- **Uninstallation & Data Deletion:**
-  - To uninstall, go to Windows Settings > **Installed apps** > **Activity Tracker** > **Uninstall** (or run `unins000.exe` in the install directory).
-  - The uninstaller will prompt: *"Also delete your recorded activity data?"*. Choosing **Yes** permanently removes `%PROGRAMDATA%\ActivityTracker` and all recorded database history. Choosing **No** (the default) removes the service, agent, and binaries while preserving your database for future use.
-  - You may also delete `%PROGRAMDATA%\ActivityTracker` manually at any time after uninstallation.
+Be aware that **window titles can contain sensitive text** (document names, video titles, chat names). The data never leaves your PC, but anyone who can use your logged-in session can run the CLI and read it.
+
+Data older than 90 days is summarised into monthly totals.
 
 ---
 
+## Using it
+
+After installing, the `tracker` command is available in any new terminal.
+
+### Live view
+```
+tracker live
+tracker live --interval 5
+```
+Shows the current state (ACTIVE / IDLE / LOCKED), the focused window and browser tab, today's top apps, domains and audio, and recent events. Press `Ctrl+C` to exit. If the output is redirected to a file, it prints one snapshot and exits. A terminal about 120 columns wide gives the best layout.
+
+### Reports
+```
+tracker report --today
+tracker report --week
+tracker report --month 2026-10
+```
+`--today` and `--week` end with a **Data quality** summary (open rows, unusually long rows, validation warnings).
+
+### Timeline
+Every event, in order, for a time range:
+```
+tracker report --timeline --from 09:00 --to 17:00
+tracker report --timeline --from 14:00 --to 16:30 --date 2026-10-20
+```
+
+### Raw rows (for debugging)
+```
+tracker report --raw vlc
+tracker report --raw chrome --date 2026-10-18
+```
+
+### Coverage audit
+```
+tracker report --coverage
+```
+Checks that window time has no gaps or double counting.
+
+---
+
+## Requirements and limits
+
+**Requirements**
+- Windows 10 version 2004 (build 19041) or newer, or Windows 11
+- 64-bit Intel/AMD (`x64`). There is no ARM or 32-bit build.
+- No .NET install needed; the installer is self-contained.
+
+**Supported browsers:** Chrome, Brave, Edge (Chromium-based). Firefox and Safari are not supported; window tracking still works for them, but website tracking does not.
+
+**Known limits**
+- The installer and binaries are **unsigned**, so SmartScreen warns, and some antivirus products may flag the installer.
+- The browser extension must be loaded manually (unpacked).
+- It tracks **one Windows user**: the user who ran the installer.
+- Microsoft-account and domain-joined PCs are untested.
+- Port `14321` on localhost must be free.
+- If media is playing, you are treated as active for as long as it plays, with no time cap. A long fully silent stretch in a video (over ~20 seconds) can briefly count as paused.
+
+---
+
+## Uninstall
+
+Settings > **Apps** > **Installed apps** > **Activity Tracker** > **Uninstall**.
+
+The uninstaller removes the service, the agent task and the program files, then asks:
+
+> *Also delete your recorded activity data?*
+
+- **No** keeps `C:\ProgramData\ActivityTracker` (database and key), so a reinstall continues where you left off.
+- **Yes** permanently deletes the database and its key. It **cannot be recovered**.
+
+Your browser extension is separate: remove it from the browser's extensions page.
+
+---
+
+## How it works
+
+Windows services run in a non-interactive session and cannot see your desktop, so the tracker is split in four parts:
+
+1. **ActivityTracker.Service**: a Native AOT Windows Service. It owns the database, applies retention, and listens on `127.0.0.1:14321`.
+2. **ActivityTracker.SessionAgent**: a small per-user process started at logon by Task Scheduler. It watches window focus, idle time, and media playback, and sends events to the service over local HTTP.
+3. **Browser extension** (Manifest V3): reports the active tab's domain and whether the tab is audible.
+4. **ActivityTracker.Cli** (`tracker`): reads the database and shows the live view and reports.
+
+**Idle detection.** You count as idle after 3 minutes without keyboard or mouse input, unless media is playing. Media counts as playing when any of these is true:
+1. the foreground app has a Windows media session in the *Playing* state;
+2. the focused browser's active tab is audible (reported by the extension);
+3. the foreground app has an active audio stream on any output device (this covers players such as VLC that do not report a media session).
+
+When playback stops, idle starts after a 20-second grace period. When you do go idle, the open rows are closed at the time of your last input, so away time is not counted.
+
+**Storage.** `C:\ProgramData\ActivityTracker\` holds `tracker.db` (SQLCipher), `db.key` (DPAPI-protected), `config.json` and `logs\`.
+
+### Threat model
+
+The key is protected with DPAPI at `LocalMachine` scope so the background service can open the database across reboots and user sessions. This protects your history against **offline theft** (someone copying the drive or the files from a powered-off machine). It does **not** protect against malware or other software already running on your PC with local permissions, because such a process can ask DPAPI to decrypt the key.
+
+---
 
 ## Configuration
 
-The service and agent read configuration from `%PROGRAMDATA%\ActivityTracker\config.json`. If the file doesn't exist, it will be generated on first run with the real defaults:
+`C:\ProgramData\ActivityTracker\config.json` is created on first run:
 
 ```json
 {
@@ -87,135 +180,71 @@ The service and agent read configuration from `%PROGRAMDATA%\ActivityTracker\con
 }
 ```
 
-## Building the Solution
-
-1. Open a terminal in the project root.
-2. Build the Service (Native AOT):
-   ```cmd
-   dotnet publish ActivityTracker.Service\ActivityTracker.Service.csproj -c Release -r win-x64 --self-contained true
-   ```
-   *(Note: This compiles to native code via Native AOT; requires C++ build tools installed via Visual Studio).*
-3. Build the SessionAgent:
-   ```cmd
-   dotnet publish ActivityTracker.SessionAgent\ActivityTracker.SessionAgent.csproj -c Release -r win-x64 --self-contained true
-   ```
-4. Build the CLI tool:
-   ```cmd
-   dotnet publish ActivityTracker.Cli\ActivityTracker.Cli.csproj -c Release -r win-x64 --self-contained true
-   ```
-
-## Installation & Registration
-
-An automated administrative installation script is provided in the repository root:
+Use `ExcludeProcesses` / `ExcludeDomains` to stop recording specific apps or sites. Restart the service after editing:
 
 ```powershell
-# Open an elevated (Administrator) PowerShell prompt:
-.\InstallAndTestService.ps1
-```
-
-This script:
-1. Validates that Administrator privileges are present.
-2. Sets strict ACLs on `%PROGRAMDATA%\ActivityTracker` (`SYSTEM:F`, `Administrators:F`, `<installing user>:M`).
-3. Idempotently recreates the `ActivityTrackerService` with automatic failure restart policies (restarting after 5s/5s/60s).
-4. Registers and launches the `ActivityTrackerSessionAgent` scheduled task for the current interactive user.
-5. Verifies service status and connectivity to `http://127.0.0.1:14321/config`.
-
----
-
-## Browser Extension Installation
-
-To track web domains and active audio, install the included Manifest V3 extension.
-
-### Configuration
-Before loading the extension into a browser, open `Extension\config.js` and edit the `BROWSER_ID` to match the target browser:
-```javascript
-export const BROWSER_ID = "brave"; // Change to "chrome" or "edge" as needed
-```
-
-### Installation
-1. Go to the extensions management page:
-   - Chrome: `chrome://extensions/`
-   - Edge: `edge://extensions/`
-   - Brave: `brave://extensions/`
-2. Enable **Developer mode** (toggle in the top right).
-3. Click **Load unpacked** and select the `Extension` directory.
-4. **Per-Browser Setup & Reloading:**
-   Repeat this process for each browser you use, ensuring you change the `BROWSER_ID` in `config.js` before loading it into each.
-   If you ever modify `config.js` or extension scripts, navigate to the extensions page and click the circular **Reload** button on the extension card to reload the service worker.
-
----
-
-## Usage
-
-Use the CLI to generate reports. The CLI queries the encrypted database securely.
-
-### Timeframe Reports
-```cmd
-ActivityTracker.Cli.exe report --today
-ActivityTracker.Cli.exe report --week
-ActivityTracker.Cli.exe report --month 2026-09
-```
-*After `--today` and `--week` reports, a **Data quality** footer is printed showing open rows, single rows exceeding 2 hours, and domain focus validation warnings.*
-
-### Timeline Report
-To inspect all events (window, browser, audio, lock) in chronological order for a time range:
-```cmd
-ActivityTracker.Cli.exe report --timeline --from 09:00 --to 17:00
-ActivityTracker.Cli.exe report --timeline --from 14:00 --to 16:30 --date 2026-10-20
-```
-
-### Diagnostic Raw Dump
-To dump raw database event rows for a specific process or domain on today or a past day:
-```cmd
-ActivityTracker.Cli.exe report --raw vlc
-ActivityTracker.Cli.exe report --raw chrome --date 2026-10-18
-```
-
----
-
-### Live View
-Monitor what the tracker is recording right now, refreshing in place:
-```cmd
-ActivityTracker.Cli.exe live
-ActivityTracker.Cli.exe live --interval 5
-```
-The live dashboard shows current state (ACTIVE / LOCKED / IDLE), the focused window and browser tab, today's top apps/domains/audio, and recent events. Press `Ctrl+C` to exit cleanly.
-
-If output is piped or redirected, a single snapshot is printed and the command exits immediately.
-
-**PowerShell alias (optional)** *(adjust the path to where you built/published the CLI)*:
-```powershell
-Set-Alias tracker "C:\My Files\Project\Activity Tracker\ActivityTracker.Cli\bin\Release\net8.0-windows\win-x64\publish\ActivityTracker.Cli.exe"
-tracker live
-tracker report --today
+# Administrator PowerShell
+sc.exe stop ActivityTrackerService
+sc.exe start ActivityTrackerService
 ```
 
 ---
 
 ## Troubleshooting
 
-### Service State
-Check whether the service is running:
-```cmd
-sc.exe query ActivityTrackerService
-```
-Start or restart the service:
-```cmd
-sc.exe stop ActivityTrackerService
-sc.exe start ActivityTrackerService
-```
+**`tracker` is not recognised.** Close the terminal and open a new one; PATH is read when a terminal starts. If it still fails, run it by full path: `& "C:\Program Files\ActivityTracker\cli\tracker.cmd" live`.
 
-### Verifying HTTP Listener
-Test whether the local listener is responding:
-```cmd
+**Check the service and agent.**
+```powershell
+Get-Service ActivityTrackerService
+Get-ScheduledTask -TaskName ActivityTrackerSessionAgent
+Get-Process ActivityTracker.SessionAgent
 curl http://127.0.0.1:14321/config
 ```
 
-### Log Paths
-If events are not being recorded or a component encounters an error, inspect the local log files:
-- **Service Log:** `%PROGRAMDATA%\ActivityTracker\logs\service.log`
-- **SessionAgent Log:** `%PROGRAMDATA%\ActivityTracker\logs\sessionagent.log`
+**Logs** (in `C:\ProgramData\ActivityTracker\logs\`):
+- `install.log`: what the installer did, step by step
+- `service.log`: the service
+- `sessionagent.log`: the agent
 
-### Browser Extension Troubleshooting
-- If tab or domain tracking stops working after updating `Extension\config.js` or `Extension\background.js`, go to `chrome://extensions` (or `brave://extensions` / `edge://extensions`) and click the circular **Reload** button on the Activity Tracker Extension card to restart the service worker.
-- Verify background service worker console output via **Inspect views: service worker** on the extensions page.
+**Websites are not being recorded.** Check that the extension is loaded in that browser and that you chose the folder for that browser (`extension-brave`, `extension-chrome` or `extension-edge`). After changing extension files, click the circular **Reload** button on its card in the extensions page.
+
+**A video player is counted as idle while playing.** Run `tracker report --raw <app>` and look at the `Media:` lines in `sessionagent.log`, then report it with both.
+
+### Reporting problems
+
+Open an issue and attach `install.log` (and the relevant lines from `service.log` / `sessionagent.log`) after removing anything you consider private, such as window titles. Mention your Windows version and edition.
+
+---
+
+## Build from source
+
+Requirements: Windows, the .NET 8 SDK or newer, and (for the Native AOT service) the Visual Studio C++ build tools.
+
+```powershell
+dotnet publish ActivityTracker.Service/ActivityTracker.Service.csproj    -c Release -r win-x64 --self-contained true -o out/service
+dotnet publish ActivityTracker.SessionAgent/ActivityTracker.SessionAgent.csproj -c Release -r win-x64 --self-contained true -o out/agent
+dotnet publish ActivityTracker.Cli/ActivityTracker.Cli.csproj            -c Release -r win-x64 --self-contained true -o out/cli
+```
+
+**Developer install** (administrator PowerShell, from the repo root): `.\InstallAndTestService.ps1` registers the service and the agent task for the current user. Load the extension from `Extension\` after setting `BROWSER_ID` in `Extension\config.js` to `brave`, `chrome` or `edge`.
+
+**Build the installer locally** (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php)):
+```powershell
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DVersion=0.0.0-dev /DServiceDir=out\service /DAgentDir=out\agent /DCliDir=out\cli installer\ActivityTracker.iss
+```
+The installer is written to `installer\output\`. Pushing a tag such as `v0.1.0` makes GitHub Actions build and publish a release (installer, per-browser extension zips and `checksums.txt`).
+
+---
+
+## Responsible use
+
+Activity Tracker is for **your own PC**, to understand your own habits.
+
+- Install it only on a computer you own, as the person whose activity it records.
+- **Do not install it on anyone else's device, or without their knowledge and informed consent.** It is not covert monitoring software, and it has no hidden or stealth mode.
+- Respect the laws and workplace policies that apply to you. Employer-managed devices may forbid installing it.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
